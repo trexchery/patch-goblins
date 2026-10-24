@@ -789,7 +789,7 @@ public class RenderTests
                 settings.Search.Text = "approval";
                 Assert.Equal(["Ask for approval"], settings.VisibleRows);
                 settings.Search.Text = "";
-                Assert.Equal(13, settings.VisibleRows.Count());
+                Assert.Equal(14, settings.VisibleRows.Count()); // both "Random switch delay" and "Automatic switch line"
                 form.CloseSettings();
                 Assert.False(form.SettingsOpen);
                 Assert.True(form.Visible); // closing settings keeps the flyout open
