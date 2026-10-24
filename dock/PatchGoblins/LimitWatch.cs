@@ -145,6 +145,8 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
 {
     /// Accounts the API refused, until their reset: no reading, however fresh it looks, puts one back before then.
     public Dictionary<int, DateTimeOffset> RefusedUntil { get; } = [];
+    /// Refusals of a model's own window ("Fable" on #2): they keep windows on that model off the account, and nothing else.
+    public Dictionary<(int Account, string Scope), DateTimeOffset> ScopedRefusedUntil { get; } = [];
     readonly HashSet<string> _handled = [];
     readonly Dictionary<(string File, long Reset), (int Account, DateTimeOffset At, string Session)> _chargedTo = []; // default-login refusals: a stuck window replays its error, so the same transcript and reset is the same refuser, until it runs again
     /// The tray moved a session: its old refusals are not its next ones.
@@ -178,13 +180,22 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
             if (again && (now - _lastTry < TimeSpan.FromSeconds(30) || !(refused is { } rn && (login().Account ?? snap.ActiveAccountNumber) == rn && RefusedUntil.TryGetValue(rn, out var until0) && until0 > now))) return null; // a repeat retries at most every 30 s: a burst of agents is not a burst of ungated spawns
             if (!again) log($"limit seen {Path.GetFileName(hit.File)} acct {refused?.ToString() ?? "?"} resets {reset:u}");
             if (refused is not { } n) return new LimitOutcome(); // unattributed: only the windows are looked at
-            if (!RefusedUntil.TryGetValue(n, out var until) || until < reset) RefusedUntil[n] = reset;
+            var model = ResumeStopped.ModelOfFile(hit.File);
+            var scope = ResumeStopped.ScopeOf(l, snap.Accounts.FirstOrDefault(a => a.Number == n), model);
+            if (scope != null)
+            {
+                if (!ScopedRefusedUntil.TryGetValue((n, scope), out var was) || was < reset) ScopedRefusedUntil[(n, scope)] = reset;
+            }
+            else if (!RefusedUntil.TryGetValue(n, out var until) || until < reset) RefusedUntil[n] = reset;
             try
             {
-                var stand = new StoppedSession(0, "", "", hit.ConfigDir, n, hit.File, Limit: l, OwnRefused: true);
+                var stand = new StoppedSession(0, "", "", hit.ConfigDir, n, hit.File, Limit: l, OwnRefused: true, Model: model);
                 if (ResumeStopped.LimitReport([stand], snap.Accounts, now, reported) is { } doc) _ = Import(doc); // not awaited: the switch does not need it, and it can wait on the usage store's lock
             }
             catch (Exception e) { log($"import-usage failed: {e.Message}"); }
+            // A model's own window ran out ("Fable"): the account still has general room for every other window, so the default
+            // login stays; the window that ran on that model is moved by itself (the tray's pass, ResumeStopped.Target).
+            if (scope != null) { if (!again) log($"limit is {scope}'s own on acct {n}: only windows on {scope} move"); return new LimitOutcome(); }
             // Only the default login moves here, and only while it is still the refuser: the engine's own check may have moved it already.
             if ((login().Account ?? snap.ActiveAccountNumber) != n) return new LimitOutcome();
             var line = threshold?.Invoke() ?? ResumeStopped.Full;

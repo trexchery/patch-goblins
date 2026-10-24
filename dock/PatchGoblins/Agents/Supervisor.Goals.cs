@@ -582,6 +582,12 @@ public sealed partial class Supervisor
                 GoalNeedsOwner(repo, goal, $"the Director believes this is achieved ({claim}) but there is no check to prove it; add a check, mark it done, or say what is missing");
                 return;
             }
+            // A check saved before Patch Goblins judged them (or written for another machine) is not rewritten: the owner replaces it.
+            if (CheckShell.Refusal(goal.Checks, Config.Shell, "Its check") is { } wrong)
+            {
+                GoalNeedsOwner(repo, goal, $"the Director believes this is achieved ({claim}), but {char.ToLowerInvariant(wrong[0])}{wrong[1..]} Answer with checks that run here");
+                return;
+            }
             List<string> commands = [.. goal.Checks];
             if (repo.Verify is { Length: > 0 } v) commands.Add(v);
             if (commands.Count == 0) { Achieve(repo, goal, claim + landed); return; }
@@ -656,6 +662,8 @@ public sealed partial class Supervisor
             : [];
         async Task<bool> Confirmed() => checks.Count == 0 || ConfirmChecks != null && await ConfirmChecks(repo, checks);
         const string Declined = "The owner did not confirm the checks in the Patch Goblins dialog, so nothing changed.";
+        // Checks this machine's shell cannot run would fail for that alone: refused before the owner is asked to confirm them.
+        if (CheckShell.Refusal(checks, Config.Shell, "The check") is { } wrong) return "Nothing changed. " + wrong;
         var now = DateTimeOffset.Now;
         if (action == "set")
         {
@@ -762,6 +770,8 @@ public sealed partial class Supervisor
             if (goal.Issue is { } gi) sb.AppendLine($"It is GitHub issue #{gi}: plan its steps; never the issue itself as a step.");
             if (goal.Checks.Count > 0)
                 sb.AppendLine($"Patch Goblins counts it achieved only when these commands, which the owner confirmed, pass on {repo.Base}: {string.Join(", ", goal.Checks.Select(c => $"`{c}`"))}.");
+            // Your own Bash tool is not the shell Patch Goblins checks with: a check you suggest must run under the latter.
+            sb.AppendLine($"Patch Goblins runs the owner's checks and the verification command itself, not in your shell. {CheckShell.Describe(Config.Shell)} Any check you suggest to the owner must be written that way.");
             if (goal.Guidance != null) sb.AppendLine().AppendLine("The owner's answer to the Director's last question (it binds you):").AppendLine(goal.Guidance);
             if (goal.Refuted != null) sb.AppendLine().AppendLine("The last plan said this goal was achieved, but Patch Goblins' check of it failed:").AppendLine(goal.Refuted);
             if (goal.Log.Count > 0) sb.AppendLine().AppendLine("This goal's history, oldest first:").AppendLine(string.Join('\n', goal.Log.TakeLast(8).Select(l => "- " + l)));

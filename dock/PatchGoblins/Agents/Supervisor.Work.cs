@@ -130,7 +130,7 @@ public sealed partial class Supervisor
                 return;
             }
             var head = (await GitAsync(wt, "rev-parse", "HEAD")).Out.Trim();
-            var (selected, elsewhere) = Policy.Select(repo.Checks, files);
+            var (selected, elsewhere) = Policy.Select(repo.Checks, files, CheckShell.Os);
             var commands = (repo.Verify is { Length: > 0 } v ? [v] : new List<string>()).Concat(selected.Select(c => c.Run)).Distinct().ToList();
             var evidence = new List<string>();
             foreach (var command in commands)

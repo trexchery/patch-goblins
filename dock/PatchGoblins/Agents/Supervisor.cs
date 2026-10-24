@@ -33,6 +33,8 @@ public sealed class AgentsConfig
     public int MaxOpenPrs { get; set; } = Supervisor.MaxOpenPrs;
     /// Open pull requests as drafts.
     public bool DraftPrs { get; set; }
+    /// The shell verification, policy and goal checks run under (AgentProcess.StartShell); tests judge as another machine would.
+    public CheckShell.Kind Shell { get; set; } = CheckShell.Runner;
     /// Off: a push never waits for the owner's yes (review notes, a policy that asks before every push), except for
     /// files the repository's policy protects: a pushed workflow runs with the repository's secrets before anyone reads it.
     public bool AskApproval { get; set; } = true;

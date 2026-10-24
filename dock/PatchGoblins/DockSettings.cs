@@ -22,7 +22,8 @@ public sealed class DockSettings
     public int AgentOpenPrs { get; set; } = 10;
     public bool AgentDraftPrs { get; set; }
     public bool AgentUltracode { get; set; }
-    public bool AskApproval { get; set; } = true; // off: agents never wait for a yes, except on files the repository's policy protects
+    public bool AskApproval { get; set; } = true;
+    public bool AutoLine { get; set; } = true; // the switch line follows each account's burn (SwitchLine); off: the engine's fixed threshold // off: agents never wait for a yes, except on files the repository's policy protects
     public DateTimeOffset? AgentSummaryAt { get; set; }
     public string? TerminalFolder { get; set; } // where "Open terminal" starts browsing; null: the user folder
 

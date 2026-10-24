@@ -11,7 +11,8 @@ namespace PatchGoblins;
 /// `Limit` is the error as recorded; `OwnRefused`: the API refused the window's own account (not one it was
 /// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
-    bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle")
+    bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
+    string? Model = null)
 {
     public bool Idle => Status == "idle";
     /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
@@ -59,6 +60,58 @@ public static class ResumeStopped
             ? new[] { u.FiveHour?.Pct ?? 0, u.SevenDay?.Pct ?? 0 }
                 .Concat((u.Scoped ?? []).Where(s => Models.Contains("all") || s.Name != null && Models.Contains(s.Name)).Select(s => s.Pct)).Max()
             : 0;
+
+    /// The reading one window is judged on: the 5-hour and weekly windows, plus the scoped windows of the model it runs
+    /// ("claude-fable-5-1" uses the "Fable" window as well as the account's general usage), and no other model's. A window
+    /// on Fable moves when either runs out; one on another model never moves for Fable. Unknown model: `Peak`.
+    public static double PeakFor(Account? a, string? model) =>
+        model == null ? Peak(a)
+        : a?.ShownUsage is { } u
+            ? new[] { u.FiveHour?.Pct ?? 0, u.SevenDay?.Pct ?? 0 }.Concat((u.Scoped ?? []).Where(s => Uses(model, s)).Select(s => s.Pct)).Max()
+            : 0;
+
+    /// Whether a model id ("claude-fable-5-1") draws on a scoped window ("Fable"). An account without that window has no
+    /// separate limit for the model (AccountPicker.ModelRoom): its general usage is all that binds there.
+    public static bool Uses(string model, Window scoped) => scoped.Name is { Length: > 0 } n && model.Contains(n, StringComparison.OrdinalIgnoreCase);
+
+    /// The model the conversation last ran: the newest assistant message's `model`. Claude Code's own error lines (a limit
+    /// refusal among them) are `<synthetic>`, so the model before the stop is what counts. Null when the tail shows none.
+    public static string? ModelOf(IEnumerable<string> lines)
+    {
+        foreach (var line in lines.Reverse())
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (Str(doc.RootElement, "type") == "assistant" && doc.RootElement.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object
+                    && Str(m, "model") is { Length: > 0 } model && !model.StartsWith('<'))
+                    return model;
+            }
+            catch (JsonException) { } // a line cut by the tail window, or one being written
+        }
+        return null;
+    }
+
+    /// Which model's own window a refusal ran out ("Fable"), or null when it was the account's general usage. Claude Code
+    /// labels a model's weekly refusal `seven_day`, as it does the general one: they are told apart by which window resets
+    /// when the refusal says, and where both reset together, by which one reads full. Only a window the session's model uses.
+    public static string? ScopeOf(Limit l, Account? a, string? model)
+    {
+        if (model == null || a?.ShownUsage is not { } u) return null;
+        var mine = (u.Scoped ?? []).Where(w => Uses(model, w)).ToList();
+        if (mine.FirstOrDefault(w => l.Window?.Contains(w.Name!, StringComparison.OrdinalIgnoreCase) == true) is { } named) return named.Name;
+        if (l.Window == "five_hour") return null; // the 5-hour window is always the account's own; any other label is judged by the windows themselves
+        bool At(Window? w) => w?.ResetsAt is { } r && l.ResetsAt is { } t && Math.Abs((r - t).TotalSeconds) <= 120;
+        return mine.FirstOrDefault(w => At(w) && !At(u.SevenDay)
+            || (At(w) || l.ResetsAt == null) && w.Pct >= Full && (u.SevenDay?.Pct ?? 0) < Full)?.Name;
+    }
+
+    /// `ModelOf` a transcript on disk; null when it cannot be read (gone, or locked).
+    public static string? ModelOfFile(string path)
+    {
+        try { return ModelOf(Tail(path)); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+    }
 
     public static string DefaultDir => Path.Combine(StoreSecurity.UserProfile, ".claude");
     static string ProfilesDir => Path.Combine(StoreSecurity.BackupRoot, "sessions");
@@ -140,9 +193,9 @@ public static class ResumeStopped
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status));
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail)));
                     else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status));
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail)));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
@@ -169,6 +222,10 @@ public static class ResumeStopped
                 var refused = r.TryGetProperty("apiErrorParams", out var p) && p.ValueKind == JsonValueKind.Object
                     && p.TryGetProperty("rate_limit_info", out info) && info.ValueKind == JsonValueKind.Object;
                 var text = r.TryGetProperty("message", out var m) ? m.ToString() : "";
+                // "You've reached your Fable limit. Run /usage-credits…": a model's own limit, with no reset time; named for the model's window.
+                var credits = Str(r, "apiError") == "model_requires_usage_credits";
+                if (credits) return new Limit(Regex.Match(text, @"reached your (\w+) limit") is { Success: true } name ? name.Groups[1].Value : "model", null,
+                    r.TryGetProperty("timestamp", out var cts) && cts.ValueKind == JsonValueKind.String && cts.TryGetDateTimeOffset(out var ct) ? ct : default);
                 if (Str(r, "apiError") != "usage_limit_reached" && !(refused && Str(info, "status") == "rejected")
                     && !(text.Contains("limit", StringComparison.OrdinalIgnoreCase)
                         && (text.Contains("hit your", StringComparison.OrdinalIgnoreCase) || text.Contains("usage", StringComparison.OrdinalIgnoreCase)))) return null;
@@ -241,24 +298,33 @@ public static class ResumeStopped
     /// other `cswap run` windows hold, which the default login cannot switch to either.
     public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
         double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
-        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null, ISet<int>? live = null)
+        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null, ISet<int>? live = null,
+        IReadOnlyDictionary<(int Account, string Scope), DateTimeOffset>? scopedRefused = null, Func<Account, double>? line = null)
     {
+        // The automatic line (SwitchLine) is per account: this window's own account moves at its line, a target must be under its own.
+        double Line(Account a) => line?.Invoke(a) ?? threshold;
+        // Judged on what this window spends: a Fable window on its general usage and its Fable window, on every account.
+        double Peak(Account a) => PeakFor(a, s.Model);
         double Weight(Account a) => Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
         bool Read(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null;
-        bool Room(Account a) => Read(a) && Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow));
+        // A model's own refusal ("Fable" out on #2) keeps only windows on that model off the account; the rest may still go there.
+        bool ModelRefused(Account a) => s.Model is { } m && scopedRefused != null
+            && scopedRefused.Any(r => r.Key.Account == a.Number && m.Contains(r.Key.Scope, StringComparison.OrdinalIgnoreCase) && r.Value > (now ?? DateTimeOffset.UtcNow));
+        bool Room(Account a) => Read(a) && Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow)) && !ModelRefused(a);
         var own = accounts.FirstOrDefault(a => a.Number == s.Account);
-        var refused = s.OwnRefused && s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow);
+        // A model's own refusal without a reset time ("Fable", from usage credits) holds until the reading says otherwise: never reopened where it was refused.
+        var refused = s.OwnRefused && (s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow) || s.Limit is { ResetsAt: null, Window: not (null or "five_hour" or "seven_day") });
         if (s.AtLimit && own != null && Room(own) && !refused) return own.Number;
-        if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < threshold)) return null;
+        if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < Line(own))) return null;
         // A move before the limit leaves alone the account the default login, near its own line, would switch to: a window moved
         // there makes it a live profile, which the engine never switches onto. (A stopped window cannot wait, so it may take it.)
         var login = accounts.FirstOrDefault(a => a.Active);
-        var kept = !s.AtLimit && login != null && login.Number != s.Account && Read(login) && Peak(login) >= threshold - hysteresis
+        var kept = !s.AtLimit && login != null && login.Number != s.Account && Read(login) && ResumeStopped.Peak(login) >= threshold - hysteresis
             ? SwitchTargets(accounts, login.Number, live ?? new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold)
                 .Select(n => (int?)n).FirstOrDefault()
             : null;
         return accounts.Where(a => a.Number != s.Account && a.Number != kept && Room(a) && (a.Active || hasProfile(a.Number)))
-            .Where(a => s.AtLimit || Peak(a) < threshold && Peak(own!) - Peak(a) >= hysteresis)
+            .Where(a => s.AtLimit || Peak(a) < Line(a) && Peak(own!) - Peak(a) >= hysteresis)
             .OrderBy(Weight).ThenByDescending(a => a.Active)
             .Select(a => (int?)a.Number).FirstOrDefault();
     }
@@ -497,10 +563,25 @@ public static class ResumeStopped
         var rows = new List<object>();
         foreach (var s in stops)
         {
-            if (!s.OwnRefused || s.Limit is not { Window: "five_hour" or "seven_day", ResetsAt: { } reset } l || reset <= now) continue;
-            if (accounts.FirstOrDefault(a => a.Number == s.Account) is not { } a || !done.Add($"{a.Number}:{reset.ToUnixTimeSeconds()}")) continue;
+            if (!s.OwnRefused || s.Limit is not { ResetsAt: { } reset } l || reset <= now) continue;
+            if (accounts.FirstOrDefault(a => a.Number == s.Account) is not { } a) continue;
+            // A model's own window that ran out is what reads full, never the account's general weekly window it shares a label with.
+            var scope = ScopeOf(l, a, s.Model);
+            if (scope == null && l.Window is not ("five_hour" or "seven_day") || !done.Add($"{a.Number}:{scope}:{reset.ToUnixTimeSeconds()}")) continue;
             var u = a.ShownUsage;
             var full = new Window(100, reset);
+            if (scope != null)
+            {
+                rows.Add(new
+                {
+                    email = a.Email,
+                    organizationUuid = a.OrganizationUuid ?? "",
+                    usageStatus = "ok",
+                    usageAgeSeconds = Math.Max(0, (now - l.At).TotalSeconds),
+                    usage = new { fiveHour = u?.FiveHour, sevenDay = u?.SevenDay, scoped = (u?.Scoped ?? []).Select(w => w.Name == scope ? full with { Name = w.Name } : w).ToList() },
+                });
+                continue;
+            }
             rows.Add(new
             {
                 email = a.Email,

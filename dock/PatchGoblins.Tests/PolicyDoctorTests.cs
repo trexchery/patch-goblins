@@ -433,3 +433,89 @@ public sealed class DoctorRepositoryTests : IDisposable
 
     public void Dispose() => _tmp.Dispose();
 }
+
+/// What a command must look like for the shell Patch Goblins runs it under (CheckShell), judged as each machine would.
+public class CheckShellTests
+{
+    // Drill Desk's own verification, policy checks and the g2 checks that do run under cmd.exe.
+    [Theory]
+    [InlineData("npm ci && npm run typecheck && npm test && npm run build")]
+    [InlineData("npm --prefix packages/desk-launch-core ci --ignore-scripts --no-fund --no-audit && npm --prefix apps/web run build:connected")]
+    [InlineData("npm --prefix apps/web run e2e:connected -- --browser=firefox --authenticator=software --suite=core")]
+    [InlineData("npx vitest run --reporter=json --outputFile.json=../../.g2-api-report.json")]
+    [InlineData("set NODE_ENV=production&& npm test")]
+    [InlineData("dotnet test -p:Configuration=Release --filter \"Category=Fast; Owner=$me\"")] // in double quotes: the program's
+    [InlineData("docker run --rm postgres:16 pg_isready >NUL 2>&1 || exit /b 1")]
+    [InlineData("powershell -NoProfile -NonInteractive -Command \"$env:X='1'; foreach ($i in 1..3) { npm test }\"")]
+    [InlineData("pwsh -Command \"npm test; exit $LASTEXITCODE\"")]
+    [InlineData("bash -c 'for i in $(seq 1 3); do X=1 npm test; done'")]
+    [InlineData(@"""C:\Program Files\Git\bin\bash.exe"" -lc 'X=1 npm test'")]
+    [InlineData(@".\build.cmd test")]
+    public void RunsUnderCmd(string command) => Assert.Null(CheckShell.Problem(command, CheckShell.Kind.Cmd));
+
+    [Theory]
+    [InlineData("DESK_TEST_DATABASE_URL=postgres://x npx vitest run", "Unix inline environment")]
+    [InlineData("cd apps/api && HELIUS_API_KEY= npx vitest run", "Unix inline environment")]
+    [InlineData("for i in $(seq 1 60); do pg_isready && break; sleep 2; done", "command substitution")]
+    [InlineData("npm test; rc=$?; exit $rc", "Unix")]
+    [InlineData("npm test && exit $rc", "Unix variable")]
+    [InlineData("echo `git rev-parse HEAD`", "command substitution")]
+    [InlineData("docker rm -f pg >/dev/null 2>&1 && npm test", "/dev/null")]
+    [InlineData("npm run lint || true", "Unix builtin")]
+    [InlineData("export CI=1 && npm test", "no command for")]
+    [InlineData("[ -f package.json ] && npm test", "no command for")]
+    [InlineData("npm ci; npm test", "command separator")]
+    [InlineData("node ~/scripts/check.mjs", "home path")]
+    public void UnixSyntaxCannotRunUnderCmd(string command, string why) =>
+        Assert.Contains(why, CheckShell.Problem(command, CheckShell.Kind.Cmd));
+
+    [Theory]
+    [InlineData("DESK_TEST_DATABASE_URL=postgres://x npx vitest run")]
+    [InlineData("for i in $(seq 1 60); do pg_isready && break; sleep 2; done && npm test")]
+    [InlineData("npm test; rc=$?; exit $rc")]
+    [InlineData("docker rm -f pg >/dev/null 2>&1 || true")]
+    [InlineData("echo '%PATH%' && npm test")] // in single quotes: literal under sh
+    [InlineData("cmd /c \"set X=1&& npm test\"")]
+    public void RunsUnderSh(string command) => Assert.Null(CheckShell.Problem(command, CheckShell.Kind.Posix));
+
+    [Theory]
+    [InlineData(@"npm test --prefix %APPDATA%\x", "cmd.exe variable")]
+    [InlineData("set CI=1&& npm test", "cmd.exe assignment")]
+    [InlineData("npm test >NUL", "cmd.exe device")]
+    [InlineData("if exist package.json npm test", "cmd.exe command")]
+    public void CmdSyntaxCannotRunUnderSh(string command, string why) =>
+        Assert.Contains(why, CheckShell.Problem(command, CheckShell.Kind.Posix));
+
+    [Fact]
+    public void TheDoctorSuggestsAWindowsJobsStepAsItsOwnShellRunsIt()
+    {
+        const string ci = """
+            jobs:
+              win:
+                runs-on: windows-latest
+                steps:
+                  - run: npm ci
+                  - run: $env:CI = 'true'; npm test
+                  - name: Api
+                    shell: bash
+                    run: DB_URL=postgres://x npx vitest run
+            """;
+        var steps = Doctor.RunSteps(ci);
+        Assert.Equal("npm ci", steps[0].Run); // cmd.exe runs it as written: unchanged
+        Assert.Equal("pwsh -NoProfile -Command \"$env:CI = 'true'; npm test\"", steps[1].Run); // GitHub's default shell on Windows
+        Assert.Equal("bash -c 'DB_URL=postgres://x npx vitest run'", steps[2].Run);
+        Assert.All(steps, s => Assert.Null(CheckShell.Problem(s.Run, CheckShell.Kind.Cmd)));
+    }
+
+    [Fact]
+    public void TheRefusalNamesTheCommandAndTellsHowToWriteItForThisShell()
+    {
+        Assert.Null(CheckShell.Refusal(["npm test", "npm run build"], CheckShell.Kind.Cmd, "The check"));
+        var refused = CheckShell.Refusal(["npm test", "X=1 npm test"], CheckShell.Kind.Cmd, "The check")!;
+        Assert.StartsWith("The check `X=1 npm test` cannot run here: `X=1` is a Unix inline environment assignment", refused);
+        Assert.Contains("powershell -NoProfile -NonInteractive -Command", refused);
+        Assert.Contains("/bin/sh", CheckShell.Describe(CheckShell.Kind.Posix));
+        Assert.Equal(OperatingSystem.IsWindows() ? CheckShell.Kind.Cmd : CheckShell.Kind.Posix, CheckShell.Runner);
+        Assert.Equal(OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsMacOS() ? "macos" : "linux", CheckShell.Os);
+    }
+}

@@ -150,7 +150,7 @@ public static class AgentsLink
             new JsonObject
             {
                 ["action"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("start", "pause", "resume", "stop") },
-                ["verify"] = new JsonObject { ["type"] = "string", ["description"] = "Command that must pass in a worktree before a pull request opens, e.g. `dotnet test` (start/resume only)." },
+                ["verify"] = new JsonObject { ["type"] = "string", ["description"] = "Command that must pass in a worktree before a pull request opens, e.g. `dotnet test` (start/resume only). " + CheckShell.Describe(CheckShell.Runner) },
                 ["base"] = new JsonObject { ["type"] = "string", ["description"] = "Base branch; defaults to the remote's default branch." },
             }, "action"),
         Tool("agents_queue", "Change what agents work on: prioritize issues (in order), skip or restore an issue, add an owner request, answer an item's question, or retry an item.",
@@ -178,7 +178,7 @@ public static class AgentsLink
                 ["goal"] = new JsonObject { ["type"] = "string", ["description"] = "answer/replan/drop/done: g1." },
                 ["title"] = new JsonObject { ["type"] = "string", ["description"] = "set: short title." },
                 ["text"] = new JsonObject { ["type"] = "string", ["description"] = "set: the objective and what done looks like; answer: the owner's answer or guidance." },
-                ["checks"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "set/answer/replan: commands that must pass on the base branch for the goal to count as achieved; they replace the goal's checks, and the owner confirms them in a Patch Goblins dialog." },
+                ["checks"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "set/answer/replan: commands that must pass on the base branch for the goal to count as achieved; they replace the goal's checks, and the owner confirms them in a Patch Goblins dialog. " + CheckShell.Describe(CheckShell.Runner) + " Patch Goblins refuses a check this shell cannot run." },
                 ["issue"] = new JsonObject { ["type"] = "integer", ["description"] = "set: an issue of this repository to adopt as the goal (its title and body)." },
             }, "action"),
         Tool("agents_doctor", "Read-only readiness check of this repository for agents: base branch and pins, unpushed or overlapping work, stale instructions, verification gaps, risky workflows, committed secrets, production side effects, issue dependencies and what agents achieved here. READY, LIMITED or BLOCKED, with evidence and fixes. Changes nothing.",

@@ -111,6 +111,12 @@ public sealed partial class Supervisor
         var shown = string.Join("\n", new[] { newVerify, Policy.Describe(policy.Checks) }.Where(s => s is { Length: > 0 }));
         if (!repo.Authorized || newVerify != repo.Verify || newBase != repo.Base || Policy.Describe(policy.Checks) != Policy.Describe(repo.Checks))
         {
+            // What is new must run under this machine's shell; what the owner confirmed before is left as it was.
+            var incoming = (newVerify != repo.Verify && newVerify is { Length: > 0 } nv ? [nv] : new List<string>())
+                .Concat(policy.Checks.Where(c => c.Os == null || c.Os.Equals(CheckShell.Os, StringComparison.OrdinalIgnoreCase))
+                    .Where(c => !repo.Checks.Any(o => o.Run == c.Run && o.Os == c.Os)).Select(c => c.Run));
+            if (CheckShell.Refusal(incoming, Config.Shell, "The command") is { } wrong)
+                return $"Nothing started: {wrong} A policy check written for another system takes an \"os\" (linux, macos or windows).";
             if (Authorize == null || !await Authorize(repo, shown.Length > 0 ? shown : null, newBase)) return "The owner did not confirm in the Patch Goblins dialog, so nothing changed.";
             repo.AuthorizedAt = DateTimeOffset.Now;
         }

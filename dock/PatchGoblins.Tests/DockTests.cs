@@ -785,7 +785,7 @@ public class RenderTests
                 settings.Search.Text = "draft";
                 Assert.Equal(["Draft pull requests"], settings.VisibleRows);
                 settings.Search.Text = "upkeep switch";
-                Assert.Equal(["Auto-switch near limit", "Switch at", "Random switch delay"], settings.VisibleRows);
+                Assert.Equal(["Auto-switch near limit", "Automatic switch line", "Switch at", "Random switch delay"], settings.VisibleRows);
                 settings.Search.Text = "approval";
                 Assert.Equal(["Ask for approval"], settings.VisibleRows);
                 settings.Search.Text = "";

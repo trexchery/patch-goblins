@@ -576,6 +576,39 @@ public class AgentProcessTests
         Assert.Empty(p.ProcessIds());
     }
 
+    /// The runner itself agrees with CheckShell: what it refuses fails under cmd.exe for shell reasons alone, and the
+    /// forms it tells the planner to use (cmd's own, or an explicit PowerShell) do the same job and pass.
+    [Fact]
+    public async Task WhatCheckShellRefusesFailsUnderTheRealRunnerAndWhatItSuggestsPasses()
+    {
+        using var tmp = new TempDir();
+        string F(string n) => Path.Combine(tmp.Path, n);
+        File.WriteAllText(F("in.txt"), "");
+        async Task<int> Run(string command)
+        {
+            using var p = AgentProcess.StartShell(command, tmp.Path, $@"Local\patch-goblins-test-{Guid.NewGuid():N}", F("in.txt"), F($"{Guid.NewGuid():N}.txt"));
+            await p.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(60));
+            await p.ReapAsync();
+            return p.ExitCode ?? -1;
+        }
+        foreach (var posix in new[] { "PG_X=1 git --version", "git --version >/dev/null" })
+        {
+            Assert.NotNull(CheckShell.Problem(posix, CheckShell.Kind.Cmd));
+            Assert.NotEqual(0, await Run(posix)); // fails for the shell alone: git itself is fine
+        }
+        Assert.NotNull(CheckShell.Problem("git --version && exit $rc", CheckShell.Kind.Cmd));
+        foreach (var native in new[]
+                 {
+                     // cmd's own form: the variable reaches the programs after `set` (not %PG_X% on this line, expanded first).
+                     "set PG_X=1&& powershell -NoProfile -NonInteractive -Command \"if ($env:PG_X -ne '1') { exit 1 }\" && git --version >NUL",
+                     "powershell -NoProfile -NonInteractive -Command \"$env:PG_X='1'; foreach ($i in 1..2) { git --version | Out-Null }; if ($env:PG_X -ne '1') { exit 1 }\"",
+                 })
+        {
+            Assert.Null(CheckShell.Problem(native, CheckShell.Kind.Cmd));
+            Assert.Equal(0, await Run(native));
+        }
+    }
+
     /// A file a live process is still writing (a plain File.ReadAllText would be refused).
     internal static string Shared(string path)
     {

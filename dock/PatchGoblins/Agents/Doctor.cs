@@ -241,6 +241,7 @@ public static class Doctor
                 os = r.Groups[1].Value.ToLowerInvariant() switch { var s when s.StartsWith("windows") => "windows", var s when s.StartsWith("macos") => "macos", "self" => null, _ => "linux" };
             if (Regex.Match(lines[i], @"^(\s*)(?:-\s+)?run:\s*(.*)$") is not { Success: true } m) continue;
             var command = m.Groups[2].Value.Trim();
+            var at = i;
             if (command is "|" or ">" or "|-" or ">-")
             {
                 var indent = m.Groups[1].Value.Length;
@@ -252,6 +253,15 @@ public static class Doctor
             }
             // Verification never runs a program from the current folder by bare name (NoDefaultCurrentDirectoryInExePath): CI's `build.cmd` is `.\build.cmd` here.
             if (os == "windows") command = Regex.Replace(command, @"^([\w.-]+\.(?:cmd|bat|exe|ps1))\b", @".\$1", RegexOptions.IgnoreCase);
+            // A Windows job's step runs under PowerShell unless it names another shell (GitHub's default); verification runs
+            // cmd.exe (CheckShell). What cmd.exe cannot run as written is suggested as CI runs it, through the step's own shell.
+            if (os == "windows" && CheckShell.Problem(command, CheckShell.Kind.Cmd) != null)
+            {
+                var named = Regex.Match(string.Join("\n", lines.Skip(Math.Max(0, at - 3)).Take(4)), @"shell:\s*(\w+)").Groups[1].Value;
+                command = named is "bash" or "sh" ? $"bash -c '{command.Replace("'", "'\\''")}'"
+                    : named == "cmd" ? command
+                    : $"pwsh -NoProfile -Command \"{command.Replace("\"", "\\\"")}\"";
+            }
             if (command.Length > 0 && !command.Contains("${{")) list.Add(new(command, null, os));
         }
         return list.DistinctBy(c => (c.Run, c.Os)).ToList();

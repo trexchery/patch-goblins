@@ -256,6 +256,36 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public async Task AFableRefusalOnTheDefaultLoginMovesNothingButTheFableWindows()
+    {
+        // Claude Code labels Fable's weekly refusal `seven_day`; it resets with #1's Fable window, not its general one.
+        var fableReset = Now.AddDays(4);
+        Account F(int n, double fable, bool active = false) => new(n, $"{n}@example.com", active, "ok",
+            new Usage(new Window(30, Now.AddHours(2)), new Window(40, Now.AddDays(2)), [new Window(fable, fableReset, "Fable")], null));
+        var rig = new Rig(F(1, 100, active: true), F(2, 10), F(3, 20));
+        var root = TempRoot();
+        try
+        {
+            var file = Write(root, "sid.jsonl", """{"type":"assistant","message":{"model":"claude-fable-5-1","content":[]}}""");
+            var o = await rig.Switch.OnLimitAsync(new LimitHit(file, ResumeStopped.DefaultDir, new Limit("seven_day", fableReset, Now)));
+            Assert.Null(o!.Switched);
+            Assert.Empty(rig.Switched); // the default login stays: every window not on Fable still has #1's general room
+            Assert.DoesNotContain(1, rig.Switch.RefusedUntil.Keys);
+            Assert.Equal(fableReset, rig.Switch.ScopedRefusedUntil[(1, "Fable")]);
+            var doc = Assert.Single(rig.Reports);
+            Assert.Contains("\"sevenDay\":{\"pct\":40", doc); // the general weekly window is not marked full
+            Assert.Contains(rig.Log, l => l.Contains("only windows on Fable move"));
+
+            // The same refusal from a window on Sonnet is the account's own weekly limit: as before, the login switches.
+            var sonnet = Write(root, "other.jsonl", """{"type":"assistant","message":{"model":"claude-sonnet-5-5","content":[]}}""");
+            var general = await rig.Switch.OnLimitAsync(new LimitHit(sonnet, ResumeStopped.DefaultDir, new Limit("seven_day", Now.AddDays(2), Now.AddSeconds(1))));
+            Assert.Equal(2, general!.Switched!.To!.Number);
+            Assert.Contains(1, rig.Switch.RefusedUntil.Keys);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
     public void RefusalIsChargedToTheAccountThatSaidNo()
     {
         var resets = Now.AddHours(2);

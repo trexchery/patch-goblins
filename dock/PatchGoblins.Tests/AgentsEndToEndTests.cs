@@ -1065,6 +1065,89 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task AGoalCheckTheRunnersShellCannotRunIsRefusedBeforeTheOwnerIsAsked()
+    {
+        var c = GoalConfig();
+        c.Shell = CheckShell.Kind.Cmd; // Windows, as it runs: cmd.exe
+        await StartAsync(c);
+        await Tool("agents_control", """{"action":"start"}""");
+        var asked = 0;
+        await _loop.Run(() => { _sup!.ConfirmChecks = (_, _) => { asked++; return Task.FromResult(true); }; return 0; });
+        const string posix = "for i in $(seq 1 60); do pg_isready && break; sleep 2; done && DB_URL=postgres://x npx vitest run";
+        var refused = await Goal(new { action = "set", title = "Api", checks = new[] { "npm test", posix } });
+        Assert.StartsWith("Nothing changed. The check `for i in $(seq 1 60)", refused);
+        Assert.Contains("cmd.exe", refused);
+        Assert.Contains("powershell -NoProfile", refused); // and how to write it so it runs
+        Assert.Equal(0, asked); // never shown to the owner
+        Assert.Empty(await On(r => r.Goals.ToList()));
+
+        // Written for an explicit shell, the same check is that shell's to run, and the owner sees it exactly.
+        IReadOnlyList<string>? shown = null;
+        await _loop.Run(() => { _sup!.ConfirmChecks = (_, cs) => { shown = cs; return Task.FromResult(true); }; return 0; });
+        var wrapped = $"bash -c '{posix}'";
+        Assert.StartsWith("Goal g1 set", await Goal(new { action = "set", title = "Api", checks = new[] { "npm test", wrapped } }));
+        Assert.Equal(["npm test", wrapped], shown);
+        Assert.Equal(["npm test", wrapped], await On(r => G(r).Checks.ToList()));
+
+        // A check refused in an answer leaves the goal's confirmed checks as they were.
+        Assert.StartsWith("Nothing changed.", await Goal(new { action = "answer", goal = "g1", checks = new[] { "X=1 npm test" } }));
+        Assert.Equal(["npm test", wrapped], await On(r => G(r).Checks.ToList()));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task OnLinuxOrMacTheSameUnixCheckIsAcceptedAndACmdOneRefused()
+    {
+        var c = GoalConfig();
+        c.Shell = CheckShell.Kind.Posix;
+        await StartAsync(c);
+        await Tool("agents_control", """{"action":"start"}""");
+        Assert.StartsWith("Goal g1 set", await Goal(new { action = "set", title = "Api", checks = new[] { "DB_URL=postgres://x npx vitest run" } }));
+        Assert.StartsWith("Nothing changed. The check `set DB_URL=x&& npx vitest run`", await Goal(new { action = "answer", goal = "g1", checks = new[] { "set DB_URL=x&& npx vitest run" } }));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ASavedCheckThisShellCannotRunAsksTheOwnerInsteadOfFailingTheClaim()
+    {
+        var c = GoalConfig();
+        c.Shell = CheckShell.Kind.Cmd;
+        await StartAsync(c);
+        await Tool("agents_control", """{"action":"start"}""");
+        Plan("""{"status":"working","summary":"later"}""");
+        await Goal(new { action = "set", title = "Api", checks = new[] { "exit 0" } });
+        await Until(r => G(r).Plans == 1, "the first plan is in");
+        // A goal saved before checks were judged (Drill Desk's g2): kept as it is, never rewritten.
+        await _loop.Run(() => { G(_sup!.RepoFor(_repo)!).Checks = ["exit 0", "DB_URL=x npx vitest run; rc=$?; exit $rc"]; return 0; });
+        Plan("""{"status":"achieved","summary":"done","evidence":"vitest passes"}""");
+        await Goal(new { action = "replan", goal = "g1" });
+        await Until(r => G(r).State == GoalState.NeedsOwner, "the owner replaces the check");
+        var note = await On(r => G(r).Note!);
+        Assert.Contains("`DB_URL=x npx vitest run; rc=$?; exit $rc` cannot run here", note);
+        Assert.Null(await On(r => G(r).Refuted)); // not run, so not a failed check
+        Assert.Equal(["exit 0", "DB_URL=x npx vitest run; rc=$?; exit $rc"], await On(r => G(r).Checks.ToList()));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ANewPolicyCheckOrVerificationTheShellCannotRunStopsTheStart()
+    {
+        var c = Fast();
+        c.Shell = CheckShell.Kind.Cmd;
+        CommitPolicy("""{"version":1,"checks":[{"run":"CI=1 git --version"}]}""");
+        await StartAsync(c);
+        var refused = await Tool("agents_control", """{"action":"start"}""");
+        Assert.StartsWith("Nothing started: The command `CI=1 git --version` cannot run here", refused);
+        Assert.Contains("\"os\"", refused);
+        Assert.False(await On(r => r?.Authorized ?? false));
+        // Marked for the system it was written for, it is skipped here, as policy checks for another system always were.
+        CommitPolicy("""{"version":1,"checks":[{"run":"CI=1 git --version","os":"linux"}]}""");
+        Assert.StartsWith("Nothing started: The command `export CI=1", await Tool("agents_control", """{"action":"start","verify":"export CI=1 && git --version"}"""));
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start","verify":"set CI=1&& git --version"}"""));
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task ABlockedPlanWaitsForTheOwnersAnswerAndTheNextPlanCarriesIt()
     {
         Plan("""{"status":"blocked","summary":"tone","question":"Formal or casual?"}""");

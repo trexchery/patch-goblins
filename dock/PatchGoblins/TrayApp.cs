@@ -29,7 +29,10 @@ public sealed partial class TrayApp : ApplicationContext
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
     int _engineSwitchBuffer; // autoswitch.switchBufferSeconds, for the settings box
-    double Threshold => _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
+    double Threshold => _settings.AutoLine && _snap?.Accounts.FirstOrDefault(a => a.Active) is { } on
+        ? _line.For(on, null) // the default login's automatic line
+        : _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
+    readonly SwitchLine _line = new();
     readonly Dictionary<string, DateTime> _busySince = []; // busy windows at a limit → when first seen so: only ones still busy after a grace are told about
     static readonly TimeSpan BusyGrace = TimeSpan.FromSeconds(10);
     readonly Dictionary<int, DateTime> _freed = []; // account → when its `cswap run` windows were last moved to the default login
@@ -148,6 +151,7 @@ public sealed partial class TrayApp : ApplicationContext
             var listed = await _engine.ListAsync(refresh || reread);
             if (switches == _switches || _snap == null) _snap = listed;
             else (_pending, _pendingAuto) = (refresh || _pending == true, _pendingAuto | runAuto); // listed before a switch the tray made: listed again
+            _line.Observe(listed.Accounts, DateTimeOffset.Now); // the automatic line's burn rates
             if (reread) Prime.Reread(DateTimeOffset.Now); // spent only on a reading that came back
             if (_settings.AutoPrime && Prime.Observe(_snap.Accounts, DateTimeOffset.Now)) Prime.Save();
             if (_settings.AutoPrime && Prime.Problem != _primeProblem && (_primeProblem = Prime.Problem) != null)
@@ -337,7 +341,7 @@ public sealed partial class TrayApp : ApplicationContext
         {
             await _movePass.WaitAsync();
             _movePass.Release();
-            (_, events) = await _engine.AutoOnceAsync();
+            (_, events) = await _engine.AutoOnceAsync(_settings.AutoLine ? Threshold : null);
         }
         finally { Interlocked.Decrement(ref _engineSwitches); }
         foreach (var e in events)
@@ -414,7 +418,8 @@ public sealed partial class TrayApp : ApplicationContext
                 continue;
             }
             if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
-            var target = s.Movable ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil) : null;
+            var target = s.Movable ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
+                line: _settings.AutoLine ? a => _line.For(a, s.Model) : null) : null;
             // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             var key = $"{s.SessionId}#{target}";
             var step = ResumeStopped.Decide(s, ResumeStopped.UserIdle(), TypingPause, target, _resumed.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
@@ -1035,6 +1040,7 @@ public sealed partial class TrayApp : ApplicationContext
         if (_engineThreshold == null) { f.Dispose(); Error("Could not read engine settings", new EngineException("cswap config did not answer")); return; }
         f.Threshold.Value = Math.Clamp((decimal)_engineThreshold.Value, f.Threshold.Minimum, f.Threshold.Maximum);
         f.SwitchBuffer.Value = Math.Clamp(_engineSwitchBuffer, (int)f.SwitchBuffer.Minimum, (int)f.SwitchBuffer.Maximum);
+        f.AutoLine.Checked = _settings.AutoLine;
         f.AutoSwitch.Checked = _settings.AutoSwitch;
         f.Startup.Checked = Startup.IsEnabled();
         f.AutoProject.Checked = _settings.AutoProjectAccount;
@@ -1068,6 +1074,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AgentDraftPrs = f.DraftPrs.Checked;
             _settings.AgentUltracode = f.Ultracode.Checked;
             _settings.AskApproval = f.AskApproval.Checked;
+            _settings.AutoLine = f.AutoLine.Checked;
             ApplyAgentSettings();
             _settings.Save();
             _timer.Interval = TimerMs;
