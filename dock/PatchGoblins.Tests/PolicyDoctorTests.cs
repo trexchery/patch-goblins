@@ -119,9 +119,80 @@ public class PolicyTests
     [Fact]
     public void WorkersAlsoGetThePolicysDenyRules()
     {
-        var args = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, deny: ["Bash(ddc *)"]);
+        var args = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, @"C:\wt", deny: ["Bash(ddc *)"]);
         var at = Array.IndexOf(args, "--disallowedTools");
         Assert.Equal(["Bash(git push *)", "Bash(gh *)", "Bash(ddc *)"], args[(at + 1)..(at + 4)]);
+        Assert.DoesNotContain("--add-dir", args); // no folder outside the worktree unless the owner names one
+    }
+
+    [Fact]
+    public void ARuleThatWouldTakeInTheWorktreeIsNarrowedToWhatIsBesideIt()
+    {
+        // #21's local policy: `agents/*` matches `agents\wt`, and a matching folder takes everything below it.
+        using var tmp = new TempDir();
+        var home = Path.Combine(tmp.Path, "home");
+        var store = Path.Combine(home, "AppData", "Local", "patch-goblins");
+        var wt = Path.Combine(store, "agents", "wt", "k-21");
+        foreach (var d in new[] { wt, Path.Combine(store, "agents", "wt", "k-2"), Path.Combine(store, "agents", "runs"), Path.Combine(store, "policies") }) Directory.CreateDirectory(d);
+        File.WriteAllText(Path.Combine(store, "agents", "state.json"), "{}");
+        File.WriteAllText(Path.Combine(store, "settings.json"), "{}");
+        string Rule(string p) => "//" + char.ToLowerInvariant(p[0]) + p[2..].Replace('\\', '/');
+        List<string> notes = [];
+        var rules = Policy.Confine(["Read(~/AppData/Local/patch-goblins/agents/*)", "Read(**/.env)", "Bash(cswap *)", "Read(./**)"], wt, home, notes);
+        Assert.Equal(new[]
+        {
+            "Read(**/.env)", "Bash(cswap *)",
+            $"Read({Rule(Path.Combine(store, "agents", "runs"))})", $"Read({Rule(Path.Combine(store, "agents", "state.json"))})", // beside wt, matched by `*`
+            $"Read({Rule(Path.Combine(store, "agents", "wt", "k-2"))})", // everything beside the worktree inside wt
+            $"Edit({Rule(Path.Combine(wt, ".claude", "settings.json"))})", $"Edit({Rule(Path.Combine(wt, ".claude", "settings.local.json"))})",
+        }.Order(), rules.Order());
+        Assert.Equal(2, notes.Count); // the narrowed rule and the dropped `./**`, both reported
+        // `patch-goblins/*` matches `agents` one level higher: the store's other entries stay denied.
+        var higher = Policy.Confine(["Read(~/AppData/Local/patch-goblins/*)"], wt, home, []);
+        Assert.Contains($"Read({Rule(Path.Combine(store, "settings.json"))})", higher);
+        Assert.Contains($"Read({Rule(Path.Combine(store, "policies"))})", higher);
+        Assert.Contains($"Read({Rule(Path.Combine(store, "agents", "wt", "k-2"))})", higher);
+        Assert.DoesNotContain(higher, r => r.Contains("k-21") && r.StartsWith("Read"));
+    }
+
+    [Fact]
+    public void FileToolsReachOnlyTheWorktreeAndTheApprovedFolders()
+    {
+        string[] roots = [@"C:\wt\k-21", @"D:\shared"];
+        int Guard(string tool, string input) => Policy.Guard(roots, $$"""{"cwd":"C:\\wt\\k-21","tool_name":"{{tool}}","tool_input":{{input}}}""", TextWriter.Null);
+        Assert.Equal(0, Guard("Read", """{"file_path":"C:\\wt\\k-21\\package.json"}"""));
+        Assert.Equal(0, Guard("Read", """{"file_path":"src/a.ts"}"""));
+        Assert.Equal(0, Guard("Edit", """{"file_path":"D:/shared/lib/x.ts"}"""));
+        Assert.Equal(0, Guard("Grep", """{"pattern":"audit"}"""));
+        Assert.Equal(0, Guard("Glob", """{"pattern":"**/package-lock.json"}"""));
+        Assert.Equal(2, Guard("Read", """{"file_path":"C:\\wt\\k-2\\package.json"}""")); // a sibling worktree: no prefix match
+        Assert.Equal(2, Guard("Read", """{"file_path":"..\\k-2\\x"}"""));
+        Assert.Equal(2, Guard("Write", """{"file_path":"C:\\Users\\me\\elsewhere\\c.txt"}"""));
+        Assert.Equal(2, Guard("Read", """{"file_path":"~/.ssh/id_ed25519"}"""));
+        Assert.Equal(2, Guard("Grep", """{"pattern":"x","path":"C:\\"}"""));
+        Assert.Equal(2, Guard("Glob", """{"pattern":"../../**/*.json"}"""));
+        Assert.Equal(2, Guard("Glob", """{"pattern":"C:/Users/**"}"""));
+        Assert.Equal(2, Policy.Guard(roots, "not json", TextWriter.Null)); // unreadable: refused, never waved through
+    }
+
+    [Fact]
+    public void OnlyTheOwnersLocalPolicyApprovesFoldersOutsideTheWorktree()
+    {
+        var local = Policy.Parse("""{"addDirs":["D:\\shared\\lib"]}""", "local");
+        Assert.Equal([@"D:\shared\lib"], Policy.Merge(new RepoPolicy(), local).AddDirs);
+        Assert.Empty(Policy.Merge(new RepoPolicy { AddDirs = [@"D:\x"] }, new RepoPolicy()).AddDirs); // a repository's own list never counts
+        foreach (var bad in new[] { "relative\\dir", "C:\\", "D:\\*", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), Path.GetDirectoryName(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))!, DockSettings.Dir })
+            Assert.Contains("addDirs", Assert.Throws<PolicyException>(() => Policy.Parse(System.Text.Json.JsonSerializer.Serialize(new { addDirs = new[] { bad } }), "p")).Message);
+        var args = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, @"C:\wt\k-21", new RunSettings("sonnet", "high", false), dirs: [@"D:\shared\lib"]);
+        Assert.Equal(@"D:\shared\lib", args[Array.IndexOf(args, "--add-dir") + 1]);
+        using var settings = System.Text.Json.JsonDocument.Parse(args[Array.IndexOf(args, "--settings") + 1]);
+        var hooks = settings.RootElement.GetProperty("hooks").GetProperty("PreToolUse");
+        Assert.Equal(Policy.GuardedTools, hooks.EnumerateArray().Select(h => h.GetProperty("matcher").GetString()));
+        Assert.DoesNotContain(args, a => a.Contains('|')); // cmd.exe would take it for a pipe
+        var hook = hooks[0];
+        var command = hook.GetProperty("hooks")[0].GetProperty("command").GetString()!;
+        Assert.Contains("\" \"guard\" \"C:/wt/k-21\" ", command);
+        Assert.EndsWith("\"D:/shared/lib\"", command);
     }
 }
 

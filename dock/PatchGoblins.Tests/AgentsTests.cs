@@ -901,7 +901,7 @@ public class AgentWorkerPolicyTests
     [Fact]
     public void RunsAreIsolatedAndCannotReachGitHub()
     {
-        var work = Supervisor.WorkerArgs(3, "sid", resume: false, review: false);
+        var work = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, @"C:\wt");
         Assert.Equal(["run", "3", "--require-session", "--"], work[..4]);
         Assert.Contains("--strict-mcp-config", work);
         Assert.Equal("sid", work[Array.IndexOf(work, "--session-id") + 1]);
@@ -909,18 +909,18 @@ public class AgentWorkerPolicyTests
         Assert.Contains("Bash(gh *)", work);
         Assert.DoesNotContain("Edit", work);
         // The only account, in use as the default login: the engine runs claude on it, never a second copy of its login; the rest stays.
-        var own = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, own: true);
+        var own = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, @"C:\wt", own: true);
         Assert.Equal(["run", "3", "--"], own[..3]);
         Assert.DoesNotContain("--require-session", own);
         Assert.Equal(work.Where(x => x != "--require-session"), own);
-        var review = Supervisor.WorkerArgs(3, "sid", resume: true, review: true);
+        var review = Supervisor.WorkerArgs(3, "sid", resume: true, review: true, @"C:\wt");
         Assert.Contains("--resume", review);
         Assert.Contains("Edit", review);
         Assert.Contains("Write", review);
-        var plan = Supervisor.WorkerArgs(3, "sid", resume: false, review: true, Routing.Plan);
+        var plan = Supervisor.WorkerArgs(3, "sid", resume: false, review: true, @"C:\wt", Routing.Plan);
         Assert.Equal("opus", plan[Array.IndexOf(plan, "--model") + 1]);
         // Every run states all three settings; none comes from the profile.
-        var routed = Supervisor.WorkerArgs(3, "sid", resume: true, review: false, new RunSettings("haiku", "max", true));
+        var routed = Supervisor.WorkerArgs(3, "sid", resume: true, review: false, @"C:\wt", new RunSettings("haiku", "max", true));
         Assert.Equal("haiku", routed[Array.IndexOf(routed, "--model") + 1]);
         Assert.Equal("max", routed[Array.IndexOf(routed, "--effort") + 1]);
         using (var settings = JsonDocument.Parse(routed[Array.IndexOf(routed, "--settings") + 1]))

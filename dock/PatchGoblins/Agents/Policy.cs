@@ -27,6 +27,10 @@ public sealed class RepoPolicy
     /// mistakes, not a determined program (docs/agents.md, isolation).
     public List<string> Deny { get; set; } = [];
     public List<PolicyCheck> Checks { get; set; } = [];
+    /// Folders outside its worktree that a repository's agents may also read and edit (Claude Code's `--add-dir`), by
+    /// full path. None by default, and only the owner's local file can name them: a repository cannot widen what its
+    /// own agents reach.
+    public List<string> AddDirs { get; set; } = [];
 
     public (string Branch, string? Pin) BaseRef =>
         Base?.Split('@', 2) is [var b, var sha] ? (b, sha) : (Base ?? "", null);
@@ -64,6 +68,12 @@ public static class Policy
         if (p.Push != null && !Pushes.Contains(p.Push)) throw new PolicyException($"{source}: push must be \"auto\" or \"ask\"");
         if (p.Checks.Any(c => string.IsNullOrWhiteSpace(c.Run))) throw new PolicyException($"{source}: every check needs a `run` command");
         if (p.Deny.Any(d => !Regex.IsMatch(d, @"^\w+(\(.+\))?$"))) throw new PolicyException($"{source}: deny entries are Claude Code tool rules, like Bash(ddc *)");
+        // Narrow on purpose: never a drive, the user folder, Patch Goblins' own folder or one holding them, and nothing
+        // that would need quoting in the hook command line.
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (p.AddDirs.FirstOrDefault(d => !Path.IsPathFullyQualified(d) || d.IndexOfAny(['*', '?', '"', '$', '%', '`']) >= 0
+                || Path.GetPathRoot(d) == Path.GetFullPath(d) || Covers(d, home) || Covers(d, DockSettings.Dir) || Covers(DockSettings.Dir, d)) is { } bad)
+            throw new PolicyException($"{source}: addDirs are folders by full path, never a drive, the user folder or Patch Goblins' own: {bad}");
         return p;
     }
 
@@ -76,6 +86,7 @@ public static class Policy
         Sensitive = [.. repo.Sensitive.Union(local.Sensitive)],
         Deny = [.. repo.Deny.Union(local.Deny)],
         Checks = [.. repo.Checks.Concat(local.Checks).DistinctBy(c => (c.Run, c.Os, Describe(c.Paths)))],
+        AddDirs = local.AddDirs,
     };
 
     public static string LocalPath(string repoPath) =>
@@ -92,6 +103,7 @@ public static class Policy
         {
             var show = await cli.GitAsync(repoPath, "show", $"{gitRef}:{FileName}");
             repo = show.Ok ? Parse(show.Out, $"{FileName} on {gitRef}") : throw new PolicyException($"could not read {FileName} on {gitRef}: {show.Why}");
+            if (repo.AddDirs.Count > 0) throw new PolicyException($"{FileName} on {gitRef}: addDirs belong in the owner's local policy ({LocalPath(repoPath)}), never in the repository");
         }
         return Merge(repo, ReadLocal(localPath ?? LocalPath(repoPath)));
     }
@@ -137,5 +149,100 @@ public static class Policy
         var p = pattern.Replace('\\', '/').TrimStart('/');
         var rx = Regex.Escape(p).Replace(@"\*\*/", "(.*/)?").Replace(@"\*\*", ".*").Replace(@"\*", "[^/]*").Replace(@"\?", "[^/]");
         return Regex.IsMatch(path, (p.Contains('/') ? "^" : "^(.*/)?") + rx + "$", RegexOptions.IgnoreCase);
+    }
+
+    /// `dir` is `path` or one of its folders.
+    public static bool Covers(string dir, string path)
+    {
+        var (d, p) = (Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)), Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)));
+        return p.Equals(d, StringComparison.OrdinalIgnoreCase) || p.StartsWith(d + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static readonly Regex PathRule = new(@"^(Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep)\((.+)\)$");
+
+    /// Claude Code's absolute path rule form: `C:\a b` is `//c/a b`.
+    static string Rule(string path) => "//" + char.ToLowerInvariant(path[0]) + path[2..].Replace('\\', '/');
+
+    /// The deny rules a worker in `worktree` gets. Claude Code matches path rules gitignore-style, and a folder that
+    /// matches takes everything below it: `Read(~/AppData/Local/patch-goblins/agents/*)` matches `agents\wt`, so it denies
+    /// every worktree, and the worker can neither read its files nor run a command there. Such a rule is narrowed to what
+    /// it denies beside the worktree: the other entries it matches beside the first folder it takes in, and everything
+    /// beside each folder below that, as they are at launch. One that takes in the worktree's files only is dropped. The
+    /// worker's own Claude Code settings in its worktree are never its to edit: its next run would load them.
+    public static List<string> Confine(IEnumerable<string> deny, string worktree, string home, List<string> notes)
+    {
+        worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath(worktree));
+        var chain = new List<string>();
+        for (var d = worktree; d != null; d = Path.GetDirectoryName(d)) chain.Insert(0, d);
+        var rules = new List<string>();
+        foreach (var rule in deny)
+        {
+            if (PathRule.Match(rule) is not { Success: true } m) { rules.Add(rule); continue; }
+            var (tool, pattern) = (m.Groups[1].Value, m.Groups[2].Value);
+            // `~/` is the user folder and `//c/` a drive; anything else is relative to the worktree.
+            var abs = pattern.StartsWith("~/") ? home.Replace('\\', '/') + pattern[1..]
+                : Regex.IsMatch(pattern, "^//[A-Za-z]/") ? pattern[2] + ":" + pattern[3..] : null;
+            string[] own = abs == null ? ["probe", "probe/probe"] : [worktree.Replace('\\', '/') + "/probe", worktree.Replace('\\', '/') + "/probe/probe"];
+            var at = abs == null ? -1 : chain.FindIndex(a => Glob(abs, a.Replace('\\', '/')));
+            if (at < 0 && !own.Any(o => Glob(abs ?? Regex.Replace(pattern, @"^\./", ""), o))) { rules.Add(rule); continue; }
+            List<string> narrowed = [];
+            if (at > 0) narrowed.AddRange(Entries(chain[at - 1]).Where(e => !Same(e, chain[at]) && Glob(abs!, e.Replace('\\', '/'))));
+            for (var j = at + 1; at >= 0 && j < chain.Count; j++) narrowed.AddRange(Entries(chain[j - 1]).Where(e => !Same(e, chain[j])));
+            // ponytail: a rule high up (`~/**`) would list hundreds of folders and overrun the command line: dropped instead
+            if (at < 0 || narrowed.Count > 100) { notes.Add($"{rule} would deny the worker its own worktree; not applied"); continue; }
+            rules.AddRange(narrowed.Select(e => $"{tool}({Rule(e)})"));
+            notes.Add($"{rule} would deny the worker its own worktree; applied to the {narrowed.Count} entries beside it");
+        }
+        rules.AddRange(new[] { "settings.json", "settings.local.json" }.Select(f => $"Edit({Rule(Path.Combine(worktree, ".claude", f))})"));
+        return rules;
+
+        static bool Same(string a, string b) => string.Equals(Path.TrimEndingDirectorySeparator(a), b, StringComparison.OrdinalIgnoreCase);
+        static IEnumerable<string> Entries(string dir)
+        {
+            try { return Directory.GetFileSystemEntries(dir); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
+        }
+    }
+
+    /// The file tools a worker's PreToolUse hook (Guard) confines, one matcher each: a `|` on the command line would be a
+    /// pipe to cmd.exe wherever the engine or claude is a .cmd.
+    public static readonly string[] GuardedTools = ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"];
+
+    /// `patch-goblins.exe guard <folder>...`, a worker's PreToolUse hook: its file tools reach only these folders. Auto
+    /// mode alone lets a worker read and write anywhere the owner's Windows user can, and Claude Code's path rules cannot
+    /// say "only here". Exit code 2 makes Claude Code refuse the call and tell the worker why; a call it cannot read is
+    /// refused too. Bash is not parsed: the owner's deny rules and auto mode's classifier cover it.
+    public static int Guard(string[] roots, string input, TextWriter why)
+    {
+        List<string> targets;
+        try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)); }
+        catch (Exception e) when (e is JsonException or InvalidOperationException or ArgumentException or KeyNotFoundException or NotSupportedException or IndexOutOfRangeException)
+        {
+            why.WriteLine("Patch Goblins could not read this tool call, so it is refused.");
+            return 2;
+        }
+        if (targets.FirstOrDefault(t => !roots.Any(r => Covers(r, t))) is not { } outside) return 0;
+        why.WriteLine($"{outside} is outside this agent's worktree and the folders its owner approved. Work inside the worktree; " +
+            "if the task truly needs that folder, ask the owner, who can add it to the repository's local policy as addDirs.");
+        return 2;
+    }
+
+    /// The paths a file tool call reaches, resolved as Claude Code does: against the session's folder, `~` as the user folder.
+    internal static List<string> Targets(string input, string fallback, string home)
+    {
+        var call = JsonDocument.Parse(input).RootElement;
+        var cwd = call.TryGetProperty("cwd", out var c) && c.GetString() is { Length: > 0 } s ? s : fallback;
+        var args = call.GetProperty("tool_input");
+        string Full(string p, string from) => Path.GetFullPath(p == "~" || p.StartsWith("~/") || p.StartsWith("~\\") ? home + p[1..] : p, from);
+        List<string> targets = [];
+        foreach (var key in new[] { "file_path", "notebook_path", "path" })
+            if (args.TryGetProperty(key, out var v) && v.GetString() is { Length: > 0 } p) targets.Add(Full(p, cwd));
+        // A Glob pattern can climb out on its own (`../../**`, `C:/Users/**`): its folders up to the first wildcard.
+        if (call.GetProperty("tool_name").GetString() == "Glob" && args.TryGetProperty("pattern", out var g) && g.GetString() is { } pattern)
+        {
+            var fixedPart = string.Join('/', pattern.Replace('\\', '/').Split('/').TakeWhile(x => x.IndexOfAny(['*', '?', '[', '{']) < 0));
+            targets.Add(Full(fixedPart.Length > 0 ? fixedPart : ".", targets.FirstOrDefault() ?? cwd));
+        }
+        return targets;
     }
 }

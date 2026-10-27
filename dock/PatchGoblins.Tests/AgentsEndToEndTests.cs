@@ -216,7 +216,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         // A work run, then a fresh review run; never the signed-in account, never without isolation.
         Assert.Equal(2, Runs.Length);
         Assert.All(Runs, r => Assert.StartsWith("run 2 --require-session -- -p", r));
-        Assert.DoesNotContain("Edit", Runs[0]);
+        Assert.DoesNotContain("Edit Write NotebookEdit", Runs[0]);
         Assert.Contains("Edit Write NotebookEdit", Runs[1]);
         Assert.All(Read(_log + ".env").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), l => Assert.Equal("patch-goblins-agent-has-no-github-access|file|", l));
         Assert.Contains(_notes, n => n.StartsWith("Pull request ready"));
@@ -408,12 +408,12 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("the greeting has no test", prompts);
         // work, (verify fails) resume, review → changes, resume, review → approved
         Assert.Equal(5, Runs.Length);
-        Assert.Equal(3, Runs.Count(r => !r.Contains("NotebookEdit")));
+        Assert.Equal(3, Runs.Count(r => !r.Contains("Edit Write NotebookEdit")));
         Assert.Equal(2, Runs.Count(r => r.Contains("--resume")));
         Assert.False(File.Exists(Path.Combine(await On(r => Item(r, 30).Worktree!), "broken.txt")));
         // Unrouted, it runs on the default route. One failed verification may be a flake: the same route resumes.
         // The review's findings are a genuine failure: the fix pass gets the stronger model, same effort, same conversation.
-        var work = Runs.Where(r => !r.Contains("NotebookEdit")).ToArray();
+        var work = Runs.Where(r => !r.Contains("Edit Write NotebookEdit")).ToArray();
         Assert.All(work[..2], r => Assert.Contains("--model sonnet --effort medium", r));
         Assert.Contains("--model opus --effort medium", work[2]);
         Assert.Contains("--resume", work[2]);
@@ -449,7 +449,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("Capacity:", director);
         // The triage plans nothing and is read-only, without workflows; the work run uses its route, the reviewer is never Haiku.
         Assert.Equal(2, await On(r => r.Items.Count));
-        Assert.Contains("NotebookEdit", Runs[0]);
+        Assert.Contains("Edit Write NotebookEdit", Runs[0]);
         Assert.Contains("--model sonnet --effort high", Runs[0]); // routing the backlog spends no Opus
         Assert.Contains("\"ultracode\":false", Runs[0]);
         Assert.Contains("issue #41", Read(_log + ".prompts").Split("---- account")[2]);
@@ -1447,7 +1447,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => G(r).Plans == 1, "the plan comes from another account");
         Assert.StartsWith("run 2 ", Runs[0]);
         Assert.StartsWith("run 3 ", Runs[1]);
-        Assert.All(Runs[..2], r => Assert.Contains("NotebookEdit", r));
+        Assert.All(Runs[..2], r => Assert.Contains("Edit Write NotebookEdit", r));
         Assert.Equal(0, await On(r => G(r).Failures)); // a limit is not the plan's fault
         _sup!.Dispose();
     }
@@ -1485,7 +1485,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 50) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the sensitive change waits for the owner");
         Assert.DoesNotContain("patch-goblins/50", Git(_repo, "ls-remote", "origin"));
         Assert.Contains("deploy/run.txt", await On(r => Item(r, 50).Note!));
-        Assert.Contains("--model opus --effort high", Runs.Single(r => r.Contains("NotebookEdit")));
+        Assert.Contains("--model opus --effort high", Runs.Single(r => r.Contains("Edit Write NotebookEdit")));
         var review = Read(_log + ".prompts").Split("---- account").Single(p => p.Contains("You are reviewing"));
         Assert.Contains("Review them adversarially", review);
         Assert.Contains("deploy/run.txt", review);
@@ -1524,7 +1524,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("tells GitHub to skip CI", Read(_log + ".prompts"));
         Assert.False(PatchGoblins.Policy.SkipsCi(Git(await On(r => Item(r, 51).Worktree!), "log", "--format=%B", "origin/main..HEAD")));
         Assert.DoesNotContain("patch-goblins/51", Git(_repo, "ls-remote", "origin"));
-        Assert.All(Runs.Where(r => !r.Contains("NotebookEdit")), r => Assert.Contains("Bash(ddc *)", r));
+        Assert.All(Runs.Where(r => !r.Contains("Edit Write NotebookEdit")), r => Assert.Contains("Bash(ddc *)", r));
         _sup!.Dispose();
     }
 
@@ -1657,7 +1657,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "push" }, "the push waits for the owner");
         var wt = await On(r => Item(r, 52).Worktree!);
         var seen = Git(wt, "rev-parse", "HEAD");
-        Assert.Single(Runs, r => r.Contains("NotebookEdit"));
+        Assert.Single(Runs, r => r.Contains("Edit Write NotebookEdit"));
 
         // Before the owner answers, the branch changes: the CI workflow moves away and another arrives under a name git quotes.
         Git(wt, "mv", ".github/workflows/ci.yml", "ci.yml.off");
@@ -1669,7 +1669,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         // The yes was for the commit the owner saw: the new one is reviewed again, adversarially, and waits again.
         await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the new commit waits for the owner");
         Assert.DoesNotContain("patch-goblins/52", Git(_repo, "ls-remote", "origin"));
-        Assert.Equal(2, Runs.Count(r => r.Contains("NotebookEdit")));
+        Assert.Equal(2, Runs.Count(r => r.Contains("Edit Write NotebookEdit")));
         var note = await On(r => Item(r, 52).Note!);
         Assert.Contains(".github/workflows/ci.yml", note);
         Assert.Contains("déploy.yml", note);

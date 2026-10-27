@@ -133,11 +133,11 @@ public static class Routing
 
     /// The flags that fix a run's model, effort and ultracode, so nothing is inherited from the profile's settings. The
     /// allowlist keeps subagents and workflow agents on these three models too; --settings is not restored on a resume,
-    /// so every launch passes it.
-    public static string[] Args(RunSettings s) =>
-    [
-        "--model", s.Model,
-        "--effort", s.Effort,
-        "--settings", JsonSerializer.Serialize(new Dictionary<string, object> { ["ultracode"] = s.Ultracode, ["availableModels"] = Models }),
-    ];
+    /// so every launch passes it, with the run's `hooks` (Claude Code reads only one --settings).
+    public static string[] Args(RunSettings s, object? hooks = null)
+    {
+        var settings = new Dictionary<string, object> { ["ultracode"] = s.Ultracode, ["availableModels"] = Models };
+        if (hooks != null) settings["hooks"] = hooks;
+        return ["--model", s.Model, "--effort", s.Effort, "--settings", JsonSerializer.Serialize(settings)];
+    }
 }

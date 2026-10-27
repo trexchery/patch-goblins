@@ -503,7 +503,9 @@ public sealed partial class Supervisor : IDisposable
                 Save();
                 return;
             }
-            string[] deny = [.. policy.Deny];
+            List<string> narrowed = [];
+            string[] deny = [.. Policy.Confine(policy.Deny, wt, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), narrowed)];
+            foreach (var n in narrowed) Program.Log($"{repo.Leaf} {item.Label}: {n}");
             var org = account.OrganizationUuid ?? "";
             var resume = !review && item.Session is { } s && s.Email == account.Email && s.Org == org;
             string prompt;
@@ -549,7 +551,7 @@ public sealed partial class Supervisor : IDisposable
             item.Route ??= Routing.Default; // started unrouted: escalation needs a base
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings, own: _solo && account.Active, deny), wt, item.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, wt, settings, own: _solo && account.Active, deny, [.. policy.AddDirs]), wt, item.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
@@ -581,18 +583,30 @@ public sealed partial class Supervisor : IDisposable
 
     /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login. `own`: the one
     /// account there is, and it is the default login (AccountPicker.Solo): the engine then launches plain claude on it, never a second copy of its login.
-    /// Runs cannot push or call gh, nor use what the repository's policy denies; reviewers cannot edit files either. Every run
-    /// states its model, effort and ultracode.
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null, bool own = false, string[]? deny = null) =>
+    /// Runs cannot push or call gh, nor use what the repository's policy denies (Policy.Confine); reviewers cannot edit files
+    /// either. Their file tools reach their worktree and the folders the owner approved (`dirs`, Policy.AddDirs), nothing
+    /// else (Policy.Guard). Every run states its model, effort and ultracode.
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, string worktree, RunSettings? settings = null, bool own = false, string[]? deny = null, string[]? dirs = null) =>
     [
         "run", account.ToString(), .. own ? (string[])[] : ["--require-session"], "--",
         "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", // a request that streams is never taken for a stall
         resume ? "--resume" : "--session-id", session,
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
+        .. (dirs ?? []).SelectMany(d => new[] { "--add-dir", d }),
         "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [], .. deny ?? [],
-        .. settings != null ? Routing.Args(settings) : [],
+        .. settings != null ? Routing.Args(settings, Guard(worktree, dirs ?? [])) : ["--settings", JsonSerializer.Serialize(new { hooks = Guard(worktree, dirs ?? []) })],
     ];
+
+    /// The PreToolUse hook that runs Policy.Guard on every file tool call, with the folders the run may reach: its
+    /// worktree, where Claude Code keeps its long tool outputs for that folder, and the owner's approved ones.
+    static object Guard(string worktree, string[] dirs)
+    {
+        string[] roots = [worktree, Path.Combine(Path.GetTempPath(), "claude", Regex.Replace(Path.GetFullPath(worktree), "[^A-Za-z0-9]", "-")), .. dirs];
+        string[] call = [Environment.ProcessPath!, "guard", .. roots];
+        var command = string.Join(' ', call.Select(a => $"\"{a.Replace('\\', '/')}\""));
+        return new { PreToolUse = Policy.GuardedTools.Select(t => new { matcher = t, hooks = new[] { new { type = "command", command } } }) };
+    }
 
     /// The tray's environment, minus anything that would point Claude elsewhere, plus a guard between
     /// runs and GitHub: no git remote, no gh login, no git credential helper; Patch Goblins pushes and opens
