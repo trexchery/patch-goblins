@@ -50,7 +50,8 @@ $account = $a[1]
 $resume = $a -contains '--resume'
 $flag = if ($resume) { '--resume' } else { '--session-id' }
 $session = $a[[array]::IndexOf($a, $flag) + 1]
-$prompt = [Console]::In.ReadToEnd()
+# The prompt file is UTF-8; [Console]::In would decode it with the console's code page under Windows PowerShell 5.1.
+$prompt = (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))).ReadToEnd()
 if ($log) {
     Log "$log.prompts" "---- account=$account resume=$resume`n$prompt"
     Log "$log.env" "$env:GH_TOKEN|$env:GIT_ALLOW_PROTOCOL|$env:CLAUDE_CONFIG_DIR"
@@ -119,7 +120,7 @@ if ($prompt -match '\[fake:bgwait\]' -and $prompt -notmatch 'You are reviewing')
 if ($prompt -match 'HANDOFF: PLAN') {
     $plan = '{"status":"working","summary":"nothing new","items":[]}'
     $next = Get-ChildItem -LiteralPath (Split-Path -Parent $log) -Filter ((Split-Path -Leaf $log) + '.plan-*.json') -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
-    if ($next) { $plan = Get-Content -Raw -LiteralPath $next.FullName; Remove-Item -LiteralPath $next.FullName }
+    if ($next) { $plan = Get-Content -Raw -Encoding UTF8 -LiteralPath $next.FullName; Remove-Item -LiteralPath $next.FullName }
     Finish "Read the project.`nHANDOFF: PLAN`n$plan"
 }
 Emit @{ type = 'assistant'; message = @{ id = 'w1'; content = @(@{ type = 'tool_use'; name = 'Write'; input = @{ file_path = "issue-$n.txt" } }); usage = @{ output_tokens = 42 } } }

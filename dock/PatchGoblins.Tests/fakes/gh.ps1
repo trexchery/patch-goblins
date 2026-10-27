@@ -12,9 +12,24 @@ function Log($path, $text) {
 }
 Log (Join-Path $dir 'gh.log') ($a -join ' ')
 
+# The test writes these files as UTF-8 without a BOM, which Windows PowerShell 5.1 reads as ANSI unless told, and may be
+# writing one right now (the file is then busy): retry rather than fail the call.
 function Read-Text($name, $default) {
     $p = Join-Path $dir $name
-    if (Test-Path -LiteralPath $p) { Get-Content -Raw -LiteralPath $p } else { $default }
+    for ($i = 0; ; $i++) {
+        try { if (Test-Path -LiteralPath $p) { return Get-Content -Raw -Encoding UTF8 -LiteralPath $p } else { return $default } }
+        catch [System.IO.IOException] { if ($i -ge 40) { throw }; Start-Sleep -Milliseconds 25 }
+    }
+}
+# Whole file at once: a reader (this fake, another call) never sees half a list. Windows PowerShell's Set-Content would write ANSI.
+function Write-Text($name, $text) {
+    $p = Join-Path $dir $name
+    $tmp = "$p.$PID.tmp"
+    [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+    for ($i = 0; ; $i++) {
+        try { if (Test-Path -LiteralPath $p) { [IO.File]::Replace($tmp, $p, [NullString]::Value) } else { [IO.File]::Move($tmp, $p) }; return }
+        catch [System.IO.IOException] { if ($i -ge 40) { throw }; Start-Sleep -Milliseconds 25 }
+    }
 }
 function Arg($name) { $i = [array]::IndexOf($a, $name); if ($i -ge 0) { $a[$i + 1] } }
 # Not piped: Windows PowerShell 5.1 emits a piped JSON array as one object, so `@(... | ConvertFrom-Json)` of '[]' counted 1 and the first PR was #8.
@@ -40,11 +55,18 @@ switch ("$($a[0]) $($a[1])") {
         exit 0
     }
     'pr create' {
-        $list = @(Prs)
-        $n = 7 + $list.Count
-        $url = "https://github.com/owner/repo/pull/$n"
-        $list += [pscustomobject]@{ number = $n; url = $url; head = (Arg '--head'); base = (Arg '--base'); title = (Arg '--title'); state = 'OPEN' }
-        Set-Content -LiteralPath (Join-Path $dir 'prs.json') -Value (ConvertTo-Json -Depth 5 -InputObject @($list))
+        # Two creates at once must not count the same list (and take one number): the lock holds from reading to writing.
+        $lock = $null
+        for ($i = 0; $i -lt 200 -and -not $lock; $i++) {
+            try { $lock = [IO.File]::Open((Join-Path $dir 'prs.lock'), 'OpenOrCreate', 'ReadWrite', 'None') } catch [System.IO.IOException] { Start-Sleep -Milliseconds 25 }
+        }
+        try {
+            $list = @(Prs)
+            $n = 7 + $list.Count
+            $url = "https://github.com/owner/repo/pull/$n"
+            $list += [pscustomobject]@{ number = $n; url = $url; head = (Arg '--head'); base = (Arg '--base'); title = (Arg '--title'); state = 'OPEN' }
+            Write-Text 'prs.json' (ConvertTo-Json -Depth 5 -InputObject @($list))
+        } finally { if ($lock) { $lock.Dispose() } }
         Copy-Item -LiteralPath (Arg '--body-file') -Destination (Join-Path $dir "pr-body-$n.md")
         $url
         exit 0

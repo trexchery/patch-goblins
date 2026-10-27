@@ -126,7 +126,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         while (!await On(r => { try { return condition(r); } catch (InvalidOperationException) { return false; } }, repo))
         {
             if (DateTime.UtcNow > until)
-                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))), repo)}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
+                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))), repo)}\nsupervisor: {await _loop.Run(() => _sup!.Diagnose())}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
             await Task.Delay(200);
         }
     }
