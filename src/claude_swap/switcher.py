@@ -1964,6 +1964,15 @@ class ClaudeAccountSwitcher:
     # refreshes it (the tray polls every 3 minutes: 15 minutes of margin).
     FOLLOW_REFRESH_MS = 20 * 60 * 1000
 
+    def follows_logins(self) -> bool:
+        """Whether a default login on a held account can be kept in step with its window.
+
+        False on macOS: the profile's login lives in a keychain entry only claude
+        writes, so ``follow_logins`` cannot re-sync the two copies of the rotating
+        token. There a held account stays refused (``exclusive``) and auto skips it,
+        as before; elsewhere a switch onto it is allowed and the copies follow."""
+        return self.platform != Platform.MACOS
+
     def follow_logins(self) -> dict:
         """Keep the default login and its live ``cswap run`` window on ONE login.
 
@@ -1986,8 +1995,8 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
-        if Platform.detect() == Platform.MACOS:
-            return {"status": "alone"}  # the profile's login lives in a keychain entry only claude writes
+        if not self.follows_logins():
+            return {"status": "alone"}
         num = self.current_account_number()
         account = (self._get_sequence_data() or {}).get("accounts", {}).get(num or "", {})
         email = account.get("email", "")
@@ -6950,7 +6959,7 @@ class ClaudeAccountSwitcher:
                 if self._session_profile_ahead(
                     target_account, pre_email, pre_org
                 ) and not self._adopt_session_credential(
-                    target_account, pre_email, pre_org, live=True
+                    target_account, pre_email, pre_org, live=self.follows_logins()
                 ):
                     who = (
                         "a live session-mode Claude instance "
