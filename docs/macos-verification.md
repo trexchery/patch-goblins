@@ -4,15 +4,15 @@ The implementation was developed in the isolated `feat/macos-parity` worktree. T
 
 ## DDC execution, 27 October 2026
 
-All development test execution ran on the already available DDC box, in an isolated directory and home. No additional box was rented by this task.
+All development test execution ran on the already available DDC box and Claude's automatically provisioned replacement, in isolated directories and homes. No additional box was rented by this task.
 
 | Verification | Observed result |
 | --- | --- |
-| Full Python regression suite with the actual backend executable enabled | 2,503 passed, 17 skipped, 5 warnings; 33.30 seconds |
+| Updated full Python regression suite with the actual backend executable enabled | 2,530 passed, 17 skipped, 5 warnings; 19.30 seconds |
 | Four separate backend test processes | 24 passed in each shard, 96 total; zero failures or skips |
 | Current backend fixes, process/security regressions, upkeep and quota recovery | 37 passed; zero failures or skips |
 | Union of backend TRX test identities | 99 distinct passing tests, including all 63 existing orchestration end-to-end tests; overlapping focused checks counted once |
-| Final menu settings persistence tests | 23 passed; 0.95 seconds |
+| Final expanded menu/provider/settings controls | 32 passed; 0.80 seconds |
 | Native CI sharder discovery against the current compiled project | 99 methods discovered; deterministic first shard contains 25 |
 
 The full Python result includes the real JSON-lines backend protocol, private IPC peer, persisted settings, concurrent approval rejection and single-instance lock checks. The process regressions include actual parent crashes, worker survival, verification termination, stale recovery records, unrelated process protection, literal arguments, private metadata and executable worktree permissions.
@@ -33,7 +33,9 @@ That macOS runner successfully performed:
 - A frozen worker with real file input/output, durable exit status 7 and private recovery metadata.
 - Startup of the actual rumps menu bar, connection to the Supervisor and a bundled-engine account snapshot, under an isolated home.
 
-The final workflow additionally checks actual Terminal launching with an executable fake engine and verifies generated MCP, goblin theme and status-line files. Its native orchestration suite runs in four isolated runner jobs. Final workflow outcomes and the current artifact link are recorded in [draft PR #16](https://github.com/trexchery/patch-goblins/pull/16); configured checks are not reported as passes until execution succeeds.
+The subsequent native run [40566350463](https://github.com/trexchery/patch-goblins/actions/runs/40566350463) at `6327090` passed all five jobs: packaging plus all four orchestration shards. It also verified actual Terminal launching with an executable fake engine, quoted paths, generated MCP, goblin theme and status-line files, and actual executable/IPC/approval checks in each shard.
+
+The current code snapshot is `92ef5ab`, which adds the final provider Keychain storage, expanded menu controls and shared manual Prime/handoff actions. Its [native run 40567645402](https://github.com/trexchery/patch-goblins/actions/runs/40567645402) has successfully built and smoke-tested the application; the [current download](https://github.com/trexchery/patch-goblins/actions/runs/40567645402/artifacts/12762814228) includes those changes. The four orchestration jobs were still running at the progress checkpoint. Final outcomes are recorded in [draft PR #16](https://github.com/trexchery/patch-goblins/pull/16).
 
 ## Verification limits
 
