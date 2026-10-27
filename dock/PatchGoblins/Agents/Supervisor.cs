@@ -966,6 +966,16 @@ public sealed partial class Supervisor : IDisposable
 
     internal bool Pumping => _pumping;
 
+    /// Why nothing starts, for a test that timed out waiting: the flags a launch needs clear, and what each goal waits on.
+    internal string Diagnose()
+    {
+        var now = DateTimeOffset.Now;
+        string Goals(RepoAgents r) => string.Join("; ", r.Goals.Select(g => $"{g.Id} replan={g.Replan} claim={g.Claim != null} wantsPlan={WantsPlan(r, g)} dueIn={Until(g.LastPlan, Config.ReplanEvery).TotalSeconds:0.0}s"));
+        return $"pumping={_pumping} again={_pumpAgain} launching={_launching} stopping={_stopping} workers={_workers.Count} verifying={_verifying.Count} gitGate={_gitGate.CurrentCount} "
+            + $"busy=[{string.Join(", ", _goalBusy.Select(b => $"{b.Key.Id}:{b.Value}"))}] notBefore=[{string.Join(", ", _notBefore.Select(n => $"{(n.Value - now).TotalSeconds:0.0}s"))}] "
+            + string.Join(" | ", _state.Repos.Select(r => $"{r.Leaf} active={Active(r)} {Goals(r)}"));
+    }
+
     public void Attach(string path)
     {
         var key = AgentStore.KeyFor(path);
