@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  apple-silicon:
+  native-orchestration:
     runs-on: macos-14
     timeout-minutes: 35
     steps:
@@ -34,6 +34,26 @@ jobs:
         env:
           PATCH_GOBLINS_TEST_BACKEND: ${{ github.workspace }}/dock/PatchGoblins.Backend/bin/Debug/net8.0/patch-goblins-backend
         run: uv run pytest tests/test_backend_host.py -n 0
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-verification
+          path: '**/TestResults/*.trx'
+          if-no-files-found: ignore
+
+  apple-silicon:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
       - name: Build standalone app, installer images, and executable smoke checks
         run: bash macos/build-macos.sh
       - name: Upload Apple Silicon application
@@ -47,10 +67,3 @@ jobs:
             dist/patch-goblins-macos-arm64.dmg.sha256
           if-no-files-found: error
           retention-days: 30
-      - name: Upload verification evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-verification
-          path: '**/TestResults/*.trx'
-          if-no-files-found: ignore
