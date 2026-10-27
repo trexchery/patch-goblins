@@ -268,6 +268,6 @@ public sealed class AgentStore(string root)
     {
         var full = System.IO.Path.GetFullPath(path).TrimEnd('\\', '/');
         if (OperatingSystem.IsWindows()) full = full.ToLowerInvariant();
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full))))[..6].ToLowerInvariant();
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full)))[..6].ToLowerInvariant();
     }
 }
