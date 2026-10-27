@@ -28,6 +28,7 @@ internal sealed partial class BackendUpkeep : IDisposable
     CancellationTokenSource? autoCancel;
     double? threshold;
     double hysteresis = 10;
+    readonly bool followsLogins;
     bool ticking, disposed;
 
     public double EffectiveThreshold => settings.AutoLine && snapshot()?.Accounts.FirstOrDefault(a => a.Active) is { } active
@@ -39,9 +40,10 @@ internal sealed partial class BackendUpkeep : IDisposable
     }
 
     public BackendUpkeep(Engine engine, DockSettings settings, Func<Snapshot?> snapshot,
-        Action<string, string> notify, Func<Task> refresh)
+        Action<string, string> notify, Func<Task> refresh, bool? followsLogins = null)
     {
         (this.engine, this.settings, this.snapshot, this.notify, this.refresh) = (engine, settings, snapshot, notify, refresh);
+        this.followsLogins = followsLogins ?? !OperatingSystem.IsMacOS(); // as Engine.SwitchNowArgs: macOS switches --exclusive, so a held account is no target
         context = SynchronizationContext.Current ?? throw new InvalidOperationException("Desktop upkeep needs the host context");
         moves = ResumeStopped.LoadMoves(movesPath);
         watch = new(hit =>
@@ -51,7 +53,7 @@ internal sealed partial class BackendUpkeep : IDisposable
         }, Program.Log);
         limits = new(snapshot, ResumeStopped.DefaultLogin, LiveOrLaunching,
             engine.ImportUsageAsync, engine.SwitchNowAsync, reported, Program.Log,
-            threshold: () => EffectiveThreshold, hysteresis: () => hysteresis);
+            threshold: () => EffectiveThreshold, hysteresis: () => hysteresis, followsLogins: this.followsLogins);
     }
 
     HashSet<int> LiveOrLaunching()
@@ -171,7 +173,7 @@ internal sealed partial class BackendUpkeep : IDisposable
             }
             var target = stop.Idle ? ResumeStopped.Target(stop, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null,
                 EffectiveThreshold, hysteresis, DateTimeOffset.UtcNow, load, limits.RefusedUntil, LiveOrLaunching(), limits.ScopedRefusedUntil,
-                line: settings.AutoLine ? a => switchLine.For(a, stop.Model) : null) : null;
+                line: settings.AutoLine ? a => switchLine.For(a, stop.Model) : null, followsLogins: followsLogins) : null;
             var key = $"{stop.SessionId}#{target}";
             var decision = ResumeStopped.Decide(stop, ResumeStopped.UserIdle(), TimeSpan.FromSeconds(5), target,
                 moves.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),

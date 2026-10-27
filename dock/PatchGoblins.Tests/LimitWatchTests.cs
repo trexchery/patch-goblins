@@ -135,7 +135,9 @@ public class LimitWatchTests
         public Func<string, Task> Report = _ => Task.CompletedTask;
         public Task SwitchGate = Task.CompletedTask;
 
-        public Rig(params Account[] accounts)
+        public Rig(params Account[] accounts) : this(true, accounts) { }
+
+        public Rig(bool followsLogins, params Account[] accounts)
         {
             Snap = new Snapshot(1, 1, [.. accounts]);
             Switch = new LimitSwitch(() => Snap, () => (Default, Changed), () => Live, d => { Reports.Add(d); return Report(d); },
@@ -147,7 +149,7 @@ public class LimitWatchTests
                     var from = Default;
                     (Default, Changed) = (m, DateTime.UtcNow);
                     return new SwitchResult(true, new AccountRef(from, $"{from}@example.com"), new AccountRef(m, $"{m}@example.com"), null);
-                }, new HashSet<string>(), Log.Add, threshold: () => Line, hysteresis: () => Hysteresis);
+                }, new HashSet<string>(), Log.Add, threshold: () => Line, hysteresis: () => Hysteresis, followsLogins: followsLogins);
         }
 
         public Task<LimitOutcome?> Hit(DateTimeOffset at, DateTimeOffset resets, string? dir = null, string file = @"C:\x\sid.jsonl") =>
@@ -672,6 +674,41 @@ public class LimitWatchTests
         var live = ResumeStopped.Launching(stamps, DateTime.UtcNow).ToHashSet();
         Assert.Equal([2], live); // the plan-time stamp counts; an old one and a move stamp do not
         Assert.Equal([3, 2], ResumeStopped.SwitchTargets(accounts, 1, live, new Dictionary<int, DateTimeOffset>(), Now)); // 2 is last, not left out: room is room
+    }
+
+    [Fact]
+    public void WithoutFollowedLoginsAHeldAccountIsNoTargetAndItsFreeingIsDue()
+    {
+        var accounts = new[] { A(1, 100, active: true), A(2, 10) };
+        var live = new HashSet<int> { 2 };
+        var none = new Dictionary<int, DateTimeOffset>();
+        // macOS: the engine refuses 2 while a window holds it, so it is not somewhere to go: free it.
+        Assert.Empty(ResumeStopped.SwitchTargets(accounts, 1, live, none, Now, followsLogins: false));
+        Assert.Equal([2], ResumeStopped.FreeTargets(accounts, live, none, Now, 97, 10, followsLogins: false));
+        Assert.Equal(2, ResumeStopped.FreeTarget(accounts, live, none, Now, 97, 10, followsLogins: false));
+        // Not held: still a target, nothing to free.
+        Assert.Equal([2], ResumeStopped.SwitchTargets(accounts, 1, new HashSet<int>(), none, Now, followsLogins: false));
+        Assert.Empty(ResumeStopped.FreeTargets(accounts, new HashSet<int>(), none, Now, 97, 10, followsLogins: false));
+    }
+
+    [Fact]
+    public void WithFollowedLoginsAHeldAccountIsLastAndNothingIsEverFreed()
+    {
+        var accounts = new[] { A(1, 100, active: true), A(2, 10) };
+        var live = new HashSet<int> { 2 };
+        var none = new Dictionary<int, DateTimeOffset>();
+        Assert.Equal([2], ResumeStopped.SwitchTargets(accounts, 1, live, none, Now, followsLogins: true)); // held, not left out
+        Assert.Empty(ResumeStopped.FreeTargets(accounts, live, none, Now, 97, 10, followsLogins: true)); // the engine has somewhere to go
+        Assert.Empty(ResumeStopped.FreeTargets(accounts, live, none, Now, 97, 10)); // and that is the default
+    }
+
+    [Fact]
+    public async Task WithoutFollowedLoginsALimitOnTheLoginIsHeldWhenOnlyAHeldAccountHasRoom()
+    {
+        var rig = new Rig(false, A(1, 50, active: true), A(2, 5)) { Live = [2] };
+        var o = await rig.Hit(Now, Now.AddHours(1));
+        Assert.True(o!.Held);
+        Assert.Empty(rig.Switched);
     }
 
     [Fact]

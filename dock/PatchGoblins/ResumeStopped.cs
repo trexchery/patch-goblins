@@ -302,7 +302,7 @@ public static class ResumeStopped
     public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
         double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
         IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null, ISet<int>? live = null,
-        IReadOnlyDictionary<(int Account, string Scope), DateTimeOffset>? scopedRefused = null, Func<Account, double>? line = null)
+        IReadOnlyDictionary<(int Account, string Scope), DateTimeOffset>? scopedRefused = null, Func<Account, double>? line = null, bool followsLogins = true)
     {
         // The automatic line (SwitchLine) is per account: this window's own account moves at its line, a target must be under its own.
         double Line(Account a) => line?.Invoke(a) ?? threshold;
@@ -323,7 +323,7 @@ public static class ResumeStopped
         // there makes it a live profile, which the engine never switches onto. (A stopped window cannot wait, so it may take it.)
         var login = accounts.FirstOrDefault(a => a.Active);
         var kept = !s.AtLimit && login != null && login.Number != s.Account && Read(login) && ResumeStopped.Peak(login) >= threshold - hysteresis
-            ? SwitchTargets(accounts, login.Number, live ?? new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold)
+            ? SwitchTargets(accounts, login.Number, live ?? new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold, followsLogins)
                 .Select(n => (int?)n).FirstOrDefault()
             : null;
         return accounts.Where(a => a.Number != s.Account && a.Number != kept && Room(a) && (a.Active || hasProfile(a.Number)))
@@ -356,11 +356,13 @@ public static class ResumeStopped
     /// holds (`liveProfiles`) is only tried after the others (two live copies of one rotating login can strand one), never
     /// left out: a window at its limit moves to any account with room. The engine refuses it if the profile's login is ahead.
     /// Below the engine's `threshold` first (above it the engine would switch again at once); only if none, anything below full.
+    /// `followsLogins` false (macOS: the engine cannot keep the two copies of a login in sync and refuses a held account): held accounts are left out.
     public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
-        IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
+        IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full, bool followsLogins = true)
     {
         var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Peak(a) < Full
-                && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
+                && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)
+                && (followsLogins || !liveProfiles.Contains(a.Number))).ToList();
         return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => liveProfiles.Contains(a.Number)).ThenBy(a => Peak(a)).Select(a => a.Number)];
     }
 
@@ -375,18 +377,18 @@ public static class ResumeStopped
     /// closing the profile's idle windows and reopening them on the default login once it switched there: one copy at a time.
     /// Only an account `hysteresis` below the threshold, so the engine stays there and nothing trades back.
     public static int? FreeTarget(IReadOnlyList<Account> accounts, ISet<int> liveProfiles, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil,
-        DateTimeOffset now, double threshold, double hysteresis) =>
-        FreeTargets(accounts, liveProfiles, refusedUntil, now, threshold, hysteresis).Select(n => (int?)n).FirstOrDefault();
+        DateTimeOffset now, double threshold, double hysteresis, bool followsLogins = true) =>
+        FreeTargets(accounts, liveProfiles, refusedUntil, now, threshold, hysteresis, followsLogins).Select(n => (int?)n).FirstOrDefault();
 
     /// Every account `FreeTarget` could free, most room first: one a working window holds must not hide the next.
     public static List<int> FreeTargets(IReadOnlyList<Account> accounts, ISet<int> liveProfiles, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil,
-        DateTimeOffset now, double threshold, double hysteresis)
+        DateTimeOffset now, double threshold, double hysteresis, bool followsLogins = true)
     {
         if (accounts.FirstOrDefault(a => a.Active) is not { } d) return [];
         var refused = refusedUntil.TryGetValue(d.Number, out var until) && until > now;
         if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Peak(d) >= threshold)) return [];
         bool Below(int n, double line) => Peak(accounts.First(a => a.Number == n)) < line;
-        if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold).Any(n => Below(n, threshold))) return []; // the engine has somewhere to go
+        if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold, followsLogins).Any(n => Below(n, threshold))) return []; // the engine has somewhere to go
         return [.. SwitchTargets(accounts, d.Number, new HashSet<int>(), refusedUntil, now, threshold)
             .Where(n => liveProfiles.Contains(n) && Below(n, threshold - hysteresis))];
     }

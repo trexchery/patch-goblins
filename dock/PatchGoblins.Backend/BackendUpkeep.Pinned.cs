@@ -10,7 +10,7 @@ internal sealed partial class BackendUpkeep
     internal async Task<bool> FreePinnedAsync(Supervisor supervisor, Snapshot snap)
     {
         var due = ResumeStopped.FreeTargets(snap.Accounts, LiveOrLaunching(), limits.RefusedUntil,
-            DateTimeOffset.UtcNow, EffectiveThreshold, hysteresis);
+            DateTimeOffset.UtcNow, EffectiveThreshold, hysteresis, followsLogins);
         if (due.Count == 0) heldProfiles.Clear();
         foreach (var number in due)
             if (await FreePinnedAsync(supervisor, snap, number)) return true;

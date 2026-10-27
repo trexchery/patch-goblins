@@ -33,7 +33,7 @@ public sealed class BackendUpkeepTests
                 using var supervisor = new Supervisor(new Engine("/bin/true"), new Cli("/usr/bin/git", null),
                     new AgentStore(Path.Combine(tmp.Path, "agents")), new AgentsConfig());
                 using var upkeep = new BackendUpkeep(new Engine("/bin/true"), new DockSettings { AutoSwitch = true, AutoLine = false },
-                    () => snapshot, (_, text) => notices.Add(text), () => Task.CompletedTask);
+                    () => snapshot, (_, text) => notices.Add(text), () => Task.CompletedTask, followsLogins: false); // macOS mode, whatever runs this test
                 Assert.False(await upkeep.FreePinnedAsync(supervisor, snapshot));
                 Assert.Equal(0, supervisor.RunsOn(snapshot.Accounts[1]));
                 return true;
