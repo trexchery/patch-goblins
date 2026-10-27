@@ -17,7 +17,8 @@ function Read-Text($name, $default) {
     if (Test-Path -LiteralPath $p) { Get-Content -Raw -LiteralPath $p } else { $default }
 }
 function Arg($name) { $i = [array]::IndexOf($a, $name); if ($i -ge 0) { $a[$i + 1] } }
-function Prs() { @(Read-Text 'prs.json' '[]' | ConvertFrom-Json) }
+# Not piped: Windows PowerShell 5.1 emits a piped JSON array as one object, so `@(... | ConvertFrom-Json)` of '[]' counted 1 and the first PR was #8.
+function Prs() { $j = ConvertFrom-Json (Read-Text 'prs.json' '[]'); @($j) }
 
 # No network: every call fails the way gh does offline.
 if (Test-Path -LiteralPath (Join-Path $dir 'offline')) { [Console]::Error.WriteLine('error connecting to api.github.com'); exit 1 }
