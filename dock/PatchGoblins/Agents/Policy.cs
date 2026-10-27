@@ -70,11 +70,19 @@ public static class Policy
         if (p.Deny.Any(d => !Regex.IsMatch(d, @"^\w+(\(.+\))?$"))) throw new PolicyException($"{source}: deny entries are Claude Code tool rules, like Bash(ddc *)");
         // Narrow on purpose: never a drive, the user folder, Patch Goblins' own folder or one holding them, and nothing
         // that would need quoting in the hook command line.
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (p.AddDirs.FirstOrDefault(d => !Path.IsPathFullyQualified(d) || d.IndexOfAny(['*', '?', '"', '$', '%', '`']) >= 0
-                || Path.GetPathRoot(d) == Path.GetFullPath(d) || Covers(d, home) || Covers(d, DockSettings.Dir) || Covers(DockSettings.Dir, d)) is { } bad)
-            throw new PolicyException($"{source}: addDirs are folders by full path, never a drive, the user folder or Patch Goblins' own: {bad}");
+        CheckAddDirs(p.AddDirs, source, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), DockSettings.Dir, IsPosix, IsMac);
         return p;
+    }
+
+    /// `posix`/`mac` and the two folders are parameters so a test can run either rule set anywhere. Relative entries, `~`
+    /// and `$HOME`-style text are not full paths and are refused; `..`, `.`, repeated and trailing slashes are resolved
+    /// before comparing (Full), and on macOS the comparison ignores case, so `/users/me` is the user folder.
+    internal static void CheckAddDirs(List<string> dirs, string source, string home, string dockDir, bool posix, bool mac)
+    {
+        if (dirs.FirstOrDefault(d => !(posix ? d.StartsWith('/') : Path.IsPathFullyQualified(d)) || d.IndexOfAny(['*', '?', '"', '$', '%', '`']) >= 0
+                || (posix ? Full(d, "/", true) == "/" : Path.GetPathRoot(d) == Path.GetFullPath(d))
+                || Covers(d, home, posix, mac) || Covers(d, dockDir, posix, mac) || Covers(dockDir, d, posix, mac)) is { } bad)
+            throw new PolicyException($"{source}: addDirs are folders by full path, never a drive, the user folder or Patch Goblins' own: {bad}");
     }
 
     /// Both restrict: lists add up, "ask" wins, the owner's local base wins over the repository's.
@@ -143,18 +151,24 @@ public static class Policy
 
     /// gitignore-style: `**` spans folders, `*` and `?` stay within one, a pattern without `/` matches at any depth.
     /// Case-insensitive, as Windows paths are. `posix`: a POSIX path, matched exactly, a backslash an ordinary character
-    /// and a leading `/` the filesystem root.
-    public static bool Glob(string pattern, string path, bool posix = false)
+    /// and a leading `/` the filesystem root; with `mac` it is matched ignoring case, as macOS's default volume does.
+    public static bool Glob(string pattern, string path, bool posix = false, bool mac = false)
     {
         if (!posix) (path, pattern) = (path.Replace('\\', '/'), pattern.Replace('\\', '/'));
         var p = posix && path.StartsWith('/') ? pattern : pattern.TrimStart('/');
         var rx = Regex.Escape(p).Replace(@"\*\*/", "(.*/)?").Replace(@"\*\*", ".*").Replace(@"\*", "[^/]*").Replace(@"\?", "[^/]");
-        return Regex.IsMatch(path, (p.Contains('/') ? "^" : "^(.*/)?") + rx + "$", posix ? RegexOptions.None : RegexOptions.IgnoreCase);
+        return Regex.IsMatch(path, (p.Contains('/') ? "^" : "^(.*/)?") + rx + "$", posix && !mac ? RegexOptions.None : RegexOptions.IgnoreCase);
     }
 
     /// Policy paths follow the operating system the agents run on: Windows paths compare ignoring case, POSIX ones are
     /// absolute from `/` and compare exactly. The `posix` parameters below let a test exercise either rule set anywhere.
     static readonly bool IsPosix = !OperatingSystem.IsWindows();
+
+    /// macOS's default (APFS) volume ignores case, so every comparison there ignores it too: the safe direction, a case
+    /// variant of a refused or protected path is refused, never a way round the rule. Plain Linux stays exact. Symbolic
+    /// links are not followed anywhere (`/tmp` is `/private/tmp` on macOS), so a link inside an allowed folder, or the
+    /// other spelling of a folder, is not seen; Unicode normalization (HFS+) is not folded either.
+    static readonly bool IsMac = OperatingSystem.IsMacOS();
 
     /// `path` made absolute against `from` with `.` and `..` resolved, no symbolic link followed. POSIX is resolved by hand
     /// so it works on any host; a relative `from` is taken from the root, which only refuses more.
@@ -169,14 +183,15 @@ public static class Policy
     }
 
     /// `dir` is `path` or one of its folders.
-    public static bool Covers(string dir, string path) => Covers(dir, path, IsPosix);
+    public static bool Covers(string dir, string path) => Covers(dir, path, IsPosix, IsMac);
 
-    internal static bool Covers(string dir, string path, bool posix)
+    internal static bool Covers(string dir, string path, bool posix, bool mac = false)
     {
         if (posix)
         {
             var (a, b) = (Full(dir, "/", true).TrimEnd('/'), Full(path, "/", true).TrimEnd('/'));
-            return b == a || b.StartsWith(a + "/", StringComparison.Ordinal);
+            var cmp = mac ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return b.Equals(a, cmp) || b.StartsWith(a + "/", cmp);
         }
         var (d, p) = (Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)), Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)));
         return p.Equals(d, StringComparison.OrdinalIgnoreCase) || p.StartsWith(d + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
@@ -193,9 +208,11 @@ public static class Policy
     /// it denies beside the worktree: the other entries it matches beside the first folder it takes in, and everything
     /// beside each folder below that, as they are at launch. One that takes in the worktree's files only is dropped. The
     /// worker's own Claude Code settings in its worktree are never its to edit: its next run would load them.
-    public static List<string> Confine(IEnumerable<string> deny, string worktree, string home, List<string> notes)
+    public static List<string> Confine(IEnumerable<string> deny, string worktree, string home, List<string> notes) =>
+        Confine(deny, worktree, home, notes, IsPosix, IsMac);
+
+    internal static List<string> Confine(IEnumerable<string> deny, string worktree, string home, List<string> notes, bool posix, bool mac)
     {
-        var posix = IsPosix;
         string Slash(string p) => posix ? p : p.Replace('\\', '/');
         string Rule(string p) => Policy.Rule(p, posix);
         worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath(worktree));
@@ -211,10 +228,10 @@ public static class Policy
                 : posix ? pattern.StartsWith("//") ? pattern[1..] : null
                 : Regex.IsMatch(pattern, "^//[A-Za-z]/") ? pattern[2] + ":" + pattern[3..] : null;
             string[] own = abs == null ? ["probe", "probe/probe"] : [Slash(worktree) + "/probe", Slash(worktree) + "/probe/probe"];
-            var at = abs == null ? -1 : chain.FindIndex(a => Glob(abs, Slash(a), posix));
-            if (at < 0 && !own.Any(o => Glob(abs ?? Regex.Replace(pattern, @"^\./", ""), o, posix))) { rules.Add(rule); continue; }
+            var at = abs == null ? -1 : chain.FindIndex(a => Glob(abs, Slash(a), posix, mac));
+            if (at < 0 && !own.Any(o => Glob(abs ?? Regex.Replace(pattern, @"^\./", ""), o, posix, mac))) { rules.Add(rule); continue; }
             List<string> narrowed = [];
-            if (at > 0) narrowed.AddRange(Entries(chain[at - 1]).Where(e => !Same(e, chain[at]) && Glob(abs!, Slash(e), posix)));
+            if (at > 0) narrowed.AddRange(Entries(chain[at - 1]).Where(e => !Same(e, chain[at]) && Glob(abs!, Slash(e), posix, mac)));
             for (var j = at + 1; at >= 0 && j < chain.Count; j++) narrowed.AddRange(Entries(chain[j - 1]).Where(e => !Same(e, chain[j])));
             // ponytail: a rule high up (`~/**`) would list hundreds of folders and overrun the command line: dropped instead
             if (at < 0 || narrowed.Count > 100) { notes.Add($"{rule} would deny the worker its own worktree; not applied"); continue; }
@@ -224,7 +241,7 @@ public static class Policy
         rules.AddRange(new[] { "settings.json", "settings.local.json" }.Select(f => $"Edit({Rule(Path.Combine(worktree, ".claude", f))})"));
         return rules;
 
-        bool Same(string a, string b) => string.Equals(Path.TrimEndingDirectorySeparator(a), b, posix ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
+        bool Same(string a, string b) => string.Equals(Path.TrimEndingDirectorySeparator(a), b, posix && !mac ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
         static IEnumerable<string> Entries(string dir)
         {
             try { return Directory.GetFileSystemEntries(dir); }
@@ -240,9 +257,9 @@ public static class Policy
     /// mode alone lets a worker read and write anywhere the owner's Windows user can, and Claude Code's path rules cannot
     /// say "only here". Exit code 2 makes Claude Code refuse the call and tell the worker why; a call it cannot read is
     /// refused too. Bash is not parsed: the owner's deny rules and auto mode's classifier cover it.
-    public static int Guard(string[] roots, string input, TextWriter why) => Guard(roots, input, why, IsPosix);
+    public static int Guard(string[] roots, string input, TextWriter why) => Guard(roots, input, why, IsPosix, IsMac);
 
-    internal static int Guard(string[] roots, string input, TextWriter why, bool posix)
+    internal static int Guard(string[] roots, string input, TextWriter why, bool posix, bool mac = false)
     {
         List<string> targets;
         try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), posix); }
@@ -251,7 +268,7 @@ public static class Policy
             why.WriteLine("Patch Goblins could not read this tool call, so it is refused.");
             return 2;
         }
-        if (targets.FirstOrDefault(t => !roots.Any(r => Covers(r, t, posix))) is not { } outside) return 0;
+        if (targets.FirstOrDefault(t => !roots.Any(r => Covers(r, t, posix, mac))) is not { } outside) return 0;
         why.WriteLine($"{outside} is outside this agent's worktree and the folders its owner approved. Work inside the worktree; " +
             "if the task truly needs that folder, ask the owner, who can add it to the repository's local policy as addDirs.");
         return 2;
