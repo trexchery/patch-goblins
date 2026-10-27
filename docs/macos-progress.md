@@ -1,4 +1,4 @@
-# macOS delivery checkpoint — 27 October 2026, 19:18 UTC
+# macOS delivery checkpoint — 27 October 2026, 19:26 UTC
 
 ## Saved state
 
@@ -22,16 +22,15 @@ Codex/Grok dormant credentials use strict verified, chunked Keychain storage on 
 - DDC final menu/provider convenience check: **32 passed**.
 - DDC backend TRX union: **99 distinct passing tests**, including all **63 existing end-to-end orchestration tests**. Four complete shards passed 24 tests each; a later 37-case focused run covers final security/upkeep fixes and additional cases without counting overlaps twice.
 - Native macOS run `40566350463` at `6327090`: **all five jobs passed**, including four orchestration shards, actual backend host tests, codesign verification, frozen worker, native menu/backend/engine startup and real Terminal/MCP/theme smoke.
-- Native run `40567645402` at `92ef5ab`: application packaging and all executable/native/Terminal smoke checks **passed**; the four native orchestration shards were still running when this checkpoint was saved.
+- Native run `40567645402` at `92ef5ab`: **all five jobs passed**, including all 99 unique backend cases, all 63 E2E cases, four executable/IPC/approval cases on every shard, packaging and all executable/native/Terminal smoke checks.
 - Current verified build download: <https://github.com/trexchery/patch-goblins/actions/runs/40567645402/artifacts/12762814228>. It contains the `.app` ZIP, DMG and SHA-256 files, including the provider storage/control changes.
 
-Raw DDC logs, TRX reports, the shard manifest and the deduplicated summary are preserved locally under the ignored `build/verification-ddc/` directory. Native package logs are preserved in `build/native-package-909.log` and `build/native-package-632.log`. Downloaded prior builds are in `dist/macos-909d898/` and `dist/macos-6327090/`. These generated artifacts are intentionally outside the source commit.
+Raw DDC logs, TRX reports, the shard manifest and the deduplicated summary are preserved locally under the ignored `build/verification-ddc/` directory. Final native reports are under `build/verification-macos-92ef5ab/` and `build/native-package-92ef5ab.log`. The final ZIP/DMG and checksums are downloaded to `dist/macos-92ef5ab/`. Their exact bytes passed SHA-256 verification on the replacement DDC box. These generated artifacts are intentionally outside the source commit.
 
 ## Remaining execution work
 
-1. Let existing native run `40567645402` finish and inspect its four shard outcomes. Let existing regression CI run `40567645507` finish, especially the Windows job.
-2. Download the final artifact to `dist/macos-92ef5ab/` and save its native package log locally.
-3. Update the PR with final run links, exact outcomes, and the final artifact. If another source fix is necessary, test it on the currently available DDC box, save it with `[skip ci]`, and report that no new native run was triggered.
-4. Keep claims bounded: no real subscription credentials/inference were used. Interactive OAuth consent and a full logout/login transition remain untested. Developer ID signing/notarization credentials were not supplied; builds are ad hoc signed.
+1. Let existing regression CI run `40567645507` finish; only its Windows job remains active. Linux and macOS Python jobs passed.
+2. Update the PR with the Windows outcome when available. If another source fix is necessary, test it on the currently available DDC box, save it with `[skip ci]`, and report that no new native run was triggered.
+3. Keep claims bounded: no real subscription credentials/inference were used. Interactive OAuth consent and a full logout/login transition remain untested. Developer ID signing/notarization credentials were not supplied; builds are ad hoc signed.
 
 Claude's replacement DDC lease was already detected and reused after the old lease ended. If that lease ends while more tests are required, check for the next existing ready lease about once per minute; do not rent a separate box. The ignored helpers `build/ddc-sync.py` and `build/ddc-evidence.py` refresh source/evidence without printing credentials.

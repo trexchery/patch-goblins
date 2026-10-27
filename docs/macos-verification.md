@@ -35,7 +35,16 @@ That macOS runner successfully performed:
 
 The subsequent native run [40566350463](https://github.com/trexchery/patch-goblins/actions/runs/40566350463) at `6327090` passed all five jobs: packaging plus all four orchestration shards. It also verified actual Terminal launching with an executable fake engine, quoted paths, generated MCP, goblin theme and status-line files, and actual executable/IPC/approval checks in each shard.
 
-The current code snapshot is `92ef5ab`, which adds the final provider Keychain storage, expanded menu controls and shared manual Prime/handoff actions. Its [native run 40567645402](https://github.com/trexchery/patch-goblins/actions/runs/40567645402) has successfully built and smoke-tested the application; the [current download](https://github.com/trexchery/patch-goblins/actions/runs/40567645402/artifacts/12762814228) includes those changes. The four orchestration jobs were still running at the progress checkpoint. Final outcomes are recorded in [draft PR #16](https://github.com/trexchery/patch-goblins/pull/16).
+The final code snapshot is `92ef5ab`, which adds provider Keychain storage, expanded menu controls and shared manual Prime/handoff actions. Its [native run 40567645402](https://github.com/trexchery/patch-goblins/actions/runs/40567645402) **passed all five jobs**. The four manifests partition exactly 99 backend test names, all passing, including all 63 existing orchestration E2E cases. Each native shard also passed the four actual backend executable/IPC/approval cases. The CI merge checkout's Git tree exactly matches the feature commit.
+
+The [final download](https://github.com/trexchery/patch-goblins/actions/runs/40567645402/artifacts/12762814228) includes those changes. The exact downloaded bytes were checked on the replacement DDC box; both SHA-256 checks passed:
+
+```text
+ZIP c4372ccef82e70fd91686e1b8c0391524ed4e28f5db59860ef820d149389781b
+DMG 94cafacc816f35de7eaa74aaf909af225d58d0c448dff6c5ce986ae90ac6ba6d
+```
+
+Final native TRX files and manifests are saved locally under `build/verification-macos-92ef5ab/`. The package log is `build/native-package-92ef5ab.log`; byte verification is `build/verification-ddc/logs/delivery-checksums-92ef5ab.log`. The full native Python regression job passed 2,528 tests with 19 skips. The existing Windows build/regression job remained running at the last checkpoint; [draft PR #16](https://github.com/trexchery/patch-goblins/pull/16) records its final outcome when available.
 
 ## Verification limits
 
