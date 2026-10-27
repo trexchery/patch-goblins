@@ -102,7 +102,7 @@ internal sealed partial class BackendUpkeep
                     try { ResumeStopped.CopyTranscript(window, ResumeStopped.DefaultDir); } catch (Exception error) { Program.Log(error); }
                     moves[$"{window.SessionId}#{number}"] = moves[ResumeStopped.MoveStamp(window.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
                     engine.LaunchConsole($"Claude · {account.ShortName} · moved", window.Cwd,
-                        Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(window, moved: false)));
+                        Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(window)));
                 }
                 catch (Exception error)
                 {

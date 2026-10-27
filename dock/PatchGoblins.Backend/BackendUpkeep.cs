@@ -199,7 +199,7 @@ internal sealed partial class BackendUpkeep : IDisposable
             try
             {
                 engine.LaunchConsole($"Claude · {account.ShortName} · resumed", stop.Cwd,
-                    Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(stop, ResumeStopped.Moved(stop, number))));
+                    Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(stop)));
             }
             catch (Exception error)
             {
