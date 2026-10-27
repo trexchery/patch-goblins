@@ -44,8 +44,11 @@ public sealed class AgentsEndToEndTests : IDisposable
         _repo = NewRepo("repo");
         var fakes = Path.Combine(AppContext.BaseDirectory, "fakes");
         // Well inside Until's 90 s: a hung fake gh is killed and logged, and Until's failure prints patch-goblins.log.
-        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd")) { GhTimeout = TimeSpan.FromSeconds(30) };
-        _engine = new Engine(Path.Combine(fakes, "cswap.cmd"));
+        if (!OperatingSystem.IsWindows())
+            foreach (var fake in new[] { "gh.sh", "cswap.sh" })
+                File.SetUnixFileMode(Path.Combine(fakes, fake), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        _cli = new Cli(Engine.FindOnPath(OperatingSystem.IsWindows() ? "git.exe" : "git")!, Path.Combine(fakes, OperatingSystem.IsWindows() ? "gh.cmd" : "gh.sh")) { GhTimeout = TimeSpan.FromSeconds(30) };
+        _engine = new Engine(Path.Combine(fakes, OperatingSystem.IsWindows() ? "cswap.cmd" : "cswap.sh"));
         _store = new AgentStore(P("agents"));
     }
 
@@ -333,7 +336,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.True(Directory.Exists(moved));
         Assert.Equal(moved, await On(r => Item(r, 10).Worktree));
         // git learns the worktree's new place, so no prune drops it with its work.
-        await AgentProcessTests.WaitUntil(() => Git(_repo, "worktree", "list", "--porcelain").Replace('/', '\\').Contains(moved, StringComparison.OrdinalIgnoreCase));
+        await AgentProcessTests.WaitUntil(() => Git(_repo, "worktree", "list", "--porcelain").Replace('\\', '/').Contains(moved.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
 
         File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
         await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
@@ -397,7 +400,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     {
         Issues("""[{"number":30,"title":"Fragile","body":"[fake:break] [fake:review-changes] Careful.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         await StartAsync();
-        await Tool("agents_control", """{"action":"start","verify":"if exist broken.txt (exit 1) else (exit 0)"}""");
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? "if exist broken.txt (exit 1) else (exit 0)" : "test ! -f broken.txt" }));
         await Until(r => Item(r, 30).State == ItemState.Open, "the item passes verification and review");
         var prompts = Read(_log + ".prompts");
         Assert.Contains("and it failed", prompts);
@@ -677,7 +680,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Issues("""[{"number":63,"title":"Small","body":"Polish.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         var ready = P("ready");
         await StartAsync();
-        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist \"{ready}\" (exit 0) else (ping -n 120 127.0.0.1 >nul)" }));
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (ping -n 120 127.0.0.1 >nul)" : $"test -f '{ready}' || sleep 120" }));
         await Task.Delay(3000); // the baseline check is under way (or about to be)
         await Terminal(open: false);
         await Task.Delay(3000);
@@ -757,7 +760,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var verifying = P("verifying");
         await StartAsync();
         // Passes on main (the baseline); in the item's worktree it hangs until something stops it.
-        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist issue-90.txt (type nul > \"{verifying}\" & ping -n 120 127.0.0.1 >nul) else (exit 0)" }));
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? $"if exist issue-90.txt (type nul > \"{verifying}\" & ping -n 120 127.0.0.1 >nul) else (exit 0)" : $"if test -f issue-90.txt; then touch '{verifying}'; sleep 120; fi" }));
         await AgentProcessTests.WaitUntil(() => File.Exists(verifying));
         var wt = await On(r => Item(r, 90).Worktree!);
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#90"}"""));
@@ -970,7 +973,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     public async Task AClaimIsRefutedByAFailingCheckThenAchievedOnceItPasses()
     {
         var ready = P("ready");
-        var check = $"if exist \"{ready}\" (exit 0) else (exit 1)";
+        var check = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (exit 1)" : $"test -f '{ready}'";
         Plan("""{"status":"achieved","summary":"already there","evidence":"it already works"}""");
         Plan("""{"status":"achieved","summary":"ready now","evidence":"ready is in place"}""");
         var since = DateTimeOffset.Now;
@@ -1451,7 +1454,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     [Fact]
     public async Task AHungGhCallIsKilledAndLoggedAtItsTimeout()
     {
-        var hung = new Cli(_cli.Git, Engine.FindOnPath("powershell.exe")!) { GhTimeout = TimeSpan.FromSeconds(1) };
+        var hung = new Cli(_cli.Git, Engine.FindOnPath(OperatingSystem.IsWindows() ? "powershell.exe" : "pwsh")!) { GhTimeout = TimeSpan.FromSeconds(1) };
         var r = await hung.GhAsync(_repo, "-NoProfile", "-Command", "Start-Sleep 60");
         Assert.Equal(124, r.Code);
         Assert.Contains("timed out after 1 s", Read(Path.Combine(P("data"), "patch-goblins.log")));

@@ -179,7 +179,8 @@ public static class ResumeStopped
                     if (bridged.Contains(pid)) { if (!includeBusy) continue; status = "agents"; }
                     var stamp = Str(r, "procStart");
                     if (!IsLiveClaude(pid, stamp)) continue;
-                    var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue; // unstamped record: the process's own start
+                    var started = OperatingSystem.IsWindows() && long.TryParse(stamp, out var ft)
+                        ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue;
                     if (TranscriptOf(dir, id, cwd) is not { } t)
                     {
                         if (status == "agents") found.Add(new StoppedSession(pid, id, cwd, dir, account, "", false, rec, Status: status));
@@ -279,6 +280,8 @@ public static class ResumeStopped
     /// moved after a quiet spell, so a prompt someone is still typing is never closed under them.
     public static TimeSpan UserIdle()
     {
+        if (OperatingSystem.IsMacOS()) return TimeSpan.FromSeconds(CGEventSourceSecondsSinceLastEventType(0, uint.MaxValue));
+        if (!OperatingSystem.IsWindows()) return TimeSpan.Zero;
         var info = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
         return GetLastInputInfo(ref info) ? TimeSpan.FromMilliseconds(unchecked((uint)Environment.TickCount - info.dwTime)) : TimeSpan.Zero;
     }
@@ -678,6 +681,18 @@ public static class ResumeStopped
     /// A process's command line, null when it cannot be read.
     static string? CommandLineOf(int pid)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var query = Process.Start(new ProcessStartInfo("/bin/ps", ["-p", pid.ToString(), "-o", "command="]) { UseShellExecute = false, RedirectStandardOutput = true });
+                if (query == null) return null;
+                var command = query.StandardOutput.ReadToEnd().Trim();
+                query.WaitForExit(3000);
+                return command.Length > 0 ? command : null;
+            }
+            catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { return null; }
+        }
         try
         {
             using var p = Process.GetProcessById(pid);
@@ -704,6 +719,7 @@ public static class ResumeStopped
     /// The handle is opened right after the start-time check, so a recycled pid is all but impossible to hit.
     internal static void EndShell(Process proc)
     {
+        if (!OperatingSystem.IsWindows()) { proc.Kill(); return; }
         if (!TerminateProcess(proc.SafeHandle.DangerousGetHandle(), 0)) throw new InvalidOperationException("TerminateProcess failed");
     }
 
@@ -764,6 +780,25 @@ public static class ResumeStopped
         try
         {
             using var p = Process.GetProcessById(pid);
+            if (p.HasExited) return false;
+            if (!OperatingSystem.IsWindows())
+            {
+                // Same stamp conventions as the existing Python engine's
+                // process_detection.pid_matches_record: Linux clock ticks;
+                // macOS ps lstart under C locale and UTC.
+                if (OperatingSystem.IsLinux() && long.TryParse(procStart, out _))
+                {
+                    var stat = File.ReadAllText($"/proc/{pid}/stat");
+                    var fields = stat[(stat.LastIndexOf(')') + 1)..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                    return fields.Length > 19 && fields[19] == procStart;
+                }
+                if (string.IsNullOrWhiteSpace(procStart)) return true; // unknown must never free a live profile
+                if (DateTime.TryParseExact(Regex.Replace(procStart, @"\s+", " "), "ddd MMM d HH:mm:ss yyyy",
+                    System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var recorded)
+                    && p.StartTime.ToUniversalTime() > recorded.AddSeconds(2))
+                    return CommandLineOf(pid)?.Contains("claude", StringComparison.OrdinalIgnoreCase) != false;
+                return true;
+            }
             // The record's start stamp names the process that wrote it, so a recycled pid never matches. The image name
             // is only a fallback for unstamped records: Claude Code's updater renames a running claude.exe to
             // claude.exe.old.<stamp>.<pid>, which would hide every window older than the update.
@@ -771,7 +806,7 @@ public static class ResumeStopped
                 return Math.Abs(p.StartTime.ToUniversalTime().ToFileTimeUtc() - ft) < TimeSpan.TicksPerSecond * 2;
             return NameOf(p.Id) == "claude";
         }
-        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
+        catch (Exception e) when (e is ArgumentException or IOException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
     }
 
     internal static string? TranscriptOf(string dir, string sessionId, string cwd)
@@ -816,6 +851,19 @@ public static class ResumeStopped
     /// grandparent (a shell between them). Never closed or moved, as the bridge and its flags would not come back.
     internal static HashSet<int> BridgeHosts()
     {
+#if !WINDOWS
+        var processes = AgentProcess.ProcessTable();
+        var unixHosts = new HashSet<int>();
+        foreach (var process in processes.Where(p => p.Pid != Environment.ProcessId))
+        {
+            var name = NameOf(process.Pid);
+            if (name is not ("patch-goblins-backend" or "patch-goblins")) continue;
+            if (CommandLineOf(process.Pid)?.Contains("agents-mcp", StringComparison.Ordinal) != true) continue;
+            unixHosts.Add(process.Parent);
+            if (processes.FirstOrDefault(p => p.Pid == process.Parent) is var parent && parent.Parent > 0) unixHosts.Add(parent.Parent);
+        }
+        return unixHosts;
+#else
         var all = new List<(int Pid, int Parent, string Exe)>();
         var snap = CreateToolhelp32Snapshot(0x2, 0);
         if (snap == -1) return [];
@@ -834,10 +882,14 @@ public static class ResumeStopped
             if (parent.TryGetValue(b.Parent, out var up)) hosts.Add(up);
         }
         return hosts;
+#endif
     }
 
     static int? ParentOf(int pid)
     {
+#if !WINDOWS
+        return AgentProcess.ProcessTable().FirstOrDefault(p => p.Pid == pid) is var process && process.Parent > 0 ? process.Parent : null;
+#else
         var snap = CreateToolhelp32Snapshot(0x2, 0);
         if (snap == -1) return null;
         try
@@ -848,6 +900,7 @@ public static class ResumeStopped
             return null;
         }
         finally { CloseHandle(snap); }
+#endif
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -872,4 +925,6 @@ public static class ResumeStopped
     struct LASTINPUTINFO { public uint cbSize, dwTime; }
 
     [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+    [DllImport("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")]
+    static extern double CGEventSourceSecondsSinceLastEventType(int stateId, uint eventType);
 }

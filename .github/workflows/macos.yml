@@ -1,0 +1,52 @@
+name: macOS application
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feat/macos-parity]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Python regression suite (synthetic credentials)
+        run: |
+          uv sync --locked --python python3.12
+          uv run --python python3.12 pytest -n 3 -o faulthandler_timeout=600
+      - name: Shared orchestration and process lifecycle
+        run: dotnet test dock/PatchGoblins.Backend.Tests/PatchGoblins.Backend.Tests.csproj --nologo --logger 'trx;LogFileName=macos-backend.trx'
+      - name: Build standalone app, installer images, and executable smoke checks
+        run: bash macos/build-macos.sh
+      - name: Upload Apple Silicon application
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-goblins-macos-arm64
+          path: |
+            dist/patch-goblins-macos-arm64.zip
+            dist/patch-goblins-macos-arm64.zip.sha256
+            dist/patch-goblins-macos-arm64.dmg
+            dist/patch-goblins-macos-arm64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-verification
+          path: '**/TestResults/*.trx'
+          if-no-files-found: ignore

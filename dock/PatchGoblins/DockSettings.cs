@@ -35,7 +35,8 @@ public sealed class DockSettings
 
     /// PATCH_GOBLINS_DATA runs a separate, isolated instance (development, benchmarks).
     public static string Dir => Env("DATA") is { Length: > 0 } d ? d : Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "patch-goblins");
+        OperatingSystem.IsMacOS() ? Path.Combine(StoreSecurity.UserProfile, "Library", "Application Support")
+            : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "patch-goblins");
 
     static string FilePath => Path.Combine(Dir, "settings.json");
 
@@ -90,14 +91,32 @@ public static class Startup
 
     public static bool IsEnabled()
     {
+        if (!OperatingSystem.IsWindows()) return File.Exists(LoginAgent);
         using var k = Registry.CurrentUser.OpenSubKey(RunKey);
         return k?.GetValue(Name) is string;
     }
 
     public static void Set(bool enabled)
     {
+        if (!OperatingSystem.IsWindows()) { SetLoginAgent(enabled); return; }
         using var k = Registry.CurrentUser.CreateSubKey(RunKey);
         if (enabled) k.SetValue(Name, $"\"{Environment.ProcessPath}\" --minimized");
         else k.DeleteValue(Name, throwOnMissingValue: false);
+    }
+
+    static string LoginAgent => Path.Combine(StoreSecurity.UserProfile, "Library", "LaunchAgents", "com.patchgoblins.app.plist");
+
+    static void SetLoginAgent(bool enabled)
+    {
+        if (!OperatingSystem.IsMacOS()) throw new PlatformNotSupportedException("Launch at login requires macOS");
+        if (!enabled) { File.Delete(LoginAgent); return; }
+        var executable = DockSettings.Env("APP_EXECUTABLE") ?? Environment.ProcessPath
+            ?? throw new InvalidOperationException("Application executable unavailable");
+        var xml = new System.Xml.Linq.XElement("plist", new System.Xml.Linq.XAttribute("version", "1.0"),
+            new System.Xml.Linq.XElement("dict", new System.Xml.Linq.XElement("key", "Label"), new System.Xml.Linq.XElement("string", "com.patchgoblins.app"),
+                new System.Xml.Linq.XElement("key", "ProgramArguments"), new System.Xml.Linq.XElement("array", new System.Xml.Linq.XElement("string", executable)),
+                new System.Xml.Linq.XElement("key", "RunAtLoad"), new System.Xml.Linq.XElement("true")));
+        AtomicFile.WriteAllText(LoginAgent, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + xml);
+        File.SetUnixFileMode(LoginAgent, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 }

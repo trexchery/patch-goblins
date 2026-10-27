@@ -53,6 +53,10 @@ packages = ["src/claude_swap"]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+macos-build = [
+    "py2app==0.28.10; sys_platform == 'darwin'",
+    "setuptools==80.9.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

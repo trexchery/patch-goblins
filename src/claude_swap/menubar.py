@@ -516,9 +516,10 @@ def framework_build_warning(
     )
 
 
-def run(switcher) -> int:
+def run(switcher, *, extension=None, app_name="claude-swap", icon=None) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    ensure_notification_identity()
+    if not getattr(sys, "frozen", False):
+        ensure_notification_identity()
     _warn = framework_build_warning()
     if _warn:
         # stderr, not stdout: launchd sends stdout to the .log file where it
@@ -556,7 +557,9 @@ def run(switcher) -> int:
 
     class MenuBarApp(rumps.App):
         def __init__(self):
-            super().__init__(ICON, quit_button=None)
+            super().__init__(app_name, title=ICON, quit_button=None)
+            if icon:
+                self.icon = str(icon)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
             # The supported paced read path: per refresh it fetches only the
@@ -577,6 +580,8 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            if extension is not None:
+                extension.start(self)
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -637,6 +642,8 @@ def run(switcher) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
+            if extension is not None:
+                extension.tick(self)
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
@@ -773,6 +780,7 @@ def run(switcher) -> int:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
 
             self.menu = [
+                *(extension.menu(self, rumps) if extension is not None else []),
                 *account_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
@@ -1004,6 +1012,8 @@ def run(switcher) -> int:
 
         def on_quit(self, _sender):
             self._stop_engine()
+            if extension is not None:
+                extension.stop()
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):

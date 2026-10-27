@@ -21,7 +21,7 @@ public sealed partial class Engine(string exe)
     {
         var env = DockSettings.Env("ENGINE");
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
-        var bundled = Path.Combine(AppContext.BaseDirectory, "engine", "cswap.exe");
+        var bundled = Path.Combine(AppContext.BaseDirectory, "engine", OperatingSystem.IsWindows() ? "cswap.exe" : "cswap");
         if (File.Exists(bundled)) return new Engine(bundled);
         // No PATH fallback: an upstream claude-swap there lacks DPAPI sealing and providers.
         throw new EngineException(
@@ -62,6 +62,7 @@ public sealed partial class Engine(string exe)
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
+            foreach (var a in PrefixArgs) psi.ArgumentList.Add(a);
             foreach (var a in args) psi.ArgumentList.Add(a);
             psi.Environment["PYTHONIOENCODING"] = "utf-8";
             psi.Environment["PYTHONUTF8"] = "1";
@@ -183,6 +184,11 @@ public sealed partial class Engine(string exe)
 
     public static void LaunchConsoleWith(string Exe, string title, string? workDir, string[] args, IReadOnlyDictionary<string, string>? env)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            LaunchPosixConsole(Exe, title, workDir, args, env);
+            return;
+        }
         var wt = FindProgram("wt.exe", WindowsApps);
         var shell = Shell;
         var psi = wt != null
@@ -234,6 +240,7 @@ public sealed partial class Engine(string exe)
     /// Machine, user and volatile variables, as Windows builds them for a new process of this user.
     internal static IReadOnlyDictionary<string, string>? FreshEnvironment()
     {
+        if (!OperatingSystem.IsWindows()) return null;
         if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x0008 /* TOKEN_QUERY */, out var token)) return null;
         try
         {
@@ -316,4 +323,34 @@ public sealed partial class Engine(string exe)
     private static partial Regex SecretPattern();
 
     public static string Redact(string s) => SecretPattern().Replace(s, "[redacted]");
+
+    /// Frozen Python applications dispatch the existing CLI through an argv prefix, never a shell string.
+    internal static string[] PrefixArgs => System.Text.Json.JsonSerializer.Deserialize<string[]>(DockSettings.Env("ENGINE_ARGS") ?? "[]") ?? [];
+
+    internal static string PosixQuote(string value) => "'" + value.Replace("'", "'\\''") + "'";
+
+    static void LaunchPosixConsole(string exe, string title, string? cwd, string[] args, IReadOnlyDictionary<string, string>? env)
+    {
+        if (!OperatingSystem.IsMacOS()) throw new PlatformNotSupportedException("Visible terminals require macOS or Windows");
+        var dir = Path.Combine(DockSettings.Dir, "terminal-launches");
+        Directory.CreateDirectory(dir);
+        var script = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".command");
+        var scriptText = new StringBuilder("#!/bin/zsh\n");
+        scriptText.Append("cd -- ").Append(PosixQuote(cwd ?? StoreSecurity.UserProfile)).Append(" || exit\n");
+        foreach (var name in SessionMarkers(Environment.GetEnvironmentVariables().Keys.OfType<string>()))
+            scriptText.Append("unset ").Append(name).Append('\n');
+        foreach (var (key, value) in env ?? new Dictionary<string, string>())
+        {
+            if (!Regex.IsMatch(key, "^[A-Za-z_][A-Za-z0-9_]*$")) throw new ArgumentException("Invalid terminal environment name");
+            scriptText.Append("export ").Append(key).Append('=').Append(PosixQuote(value)).Append('\n');
+        }
+        var prefix = exe == Locate().Exe ? PrefixArgs : [];
+        scriptText.Append("rm -- ").Append(PosixQuote(script)).Append('\n');
+        scriptText.Append(string.Join(' ', new[] { exe }.Concat(prefix).Concat(args).Select(PosixQuote))).Append('\n');
+        File.WriteAllText(script, scriptText.ToString());
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var psi = new ProcessStartInfo("/usr/bin/open") { UseShellExecute = false };
+        foreach (var arg in new[] { "-a", "Terminal", script }) psi.ArgumentList.Add(arg);
+        Process.Start(psi)?.Dispose();
+    }
 }

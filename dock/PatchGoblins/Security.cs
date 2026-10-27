@@ -8,10 +8,13 @@ public static class StoreSecurity
 {
     // Same resolution as the engine's Path.home() (USERPROFILE first).
     public static string UserProfile =>
-        Environment.GetEnvironmentVariable("USERPROFILE") is { Length: > 0 } p ? p : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        Environment.GetEnvironmentVariable(OperatingSystem.IsWindows() ? "USERPROFILE" : "HOME") is { Length: > 0 } p ? p : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     /// The engine's store on Windows (paths.get_backup_root).
-    public static string BackupRoot => Path.Combine(UserProfile, ".claude-swap-backup");
+    public static string BackupRoot => OperatingSystem.IsLinux()
+        ? Path.Combine(Environment.GetEnvironmentVariable("XDG_DATA_HOME") is { Length: > 0 } xdg && Path.IsPathRooted(xdg)
+            ? xdg : Path.Combine(UserProfile, ".local", "share"), "claude-swap")
+        : Path.Combine(UserProfile, ".claude-swap-backup");
 
     /// Replace the directory's DACL with "current user + SYSTEM only", no
     /// inherited entries, propagated to everything below it. Backups and
@@ -19,6 +22,16 @@ public static class StoreSecurity
     public static void Harden(string dir)
     {
         Directory.CreateDirectory(dir);
+        if (!OperatingSystem.IsWindows())
+        {
+            if (new DirectoryInfo(dir).LinkTarget != null) throw new IOException("Private data directory must not be a symbolic link");
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            foreach (var item in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }))
+                File.SetUnixFileMode(item.FullName, item is DirectoryInfo
+                    ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                    : UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            return;
+        }
         var sec = new DirectorySecurity();
         sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
         const InheritanceFlags inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
@@ -47,6 +60,7 @@ public static class StoreSecurity
     /// True when only the current user and SYSTEM hold access entries.
     public static bool IsHardened(string dir)
     {
+        if (!OperatingSystem.IsWindows()) return (File.GetUnixFileMode(dir) & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute)) == 0;
         var me = WindowsIdentity.GetCurrent().User!;
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var acl = new DirectoryInfo(dir).GetAccessControl();
@@ -60,7 +74,9 @@ public static class ClaudeCli
 {
     /// Claude Code's executable (native installer, winget, or npm shim).
     public static string? Find() =>
-        Engine.FindOnPath("claude.exe")
+        !OperatingSystem.IsWindows() ? Engine.FindOnPath("claude")
+            ?? new[] { Path.Combine(StoreSecurity.UserProfile, ".local", "bin", "claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude" }.FirstOrDefault(File.Exists)
+        : Engine.FindOnPath("claude.exe")
         ?? new[] { Path.Combine(StoreSecurity.UserProfile, ".local", "bin", "claude.exe") }.FirstOrDefault(File.Exists)
         ?? Engine.FindOnPath("claude.cmd");
 
@@ -149,6 +165,8 @@ public static class ProviderCli
 
     public static string? Find(string provider)
     {
+        if (!OperatingSystem.IsWindows()) return Engine.FindOnPath(provider)
+            ?? new[] { Path.Combine(StoreSecurity.UserProfile, ".local", "bin", provider), Path.Combine("/opt/homebrew/bin", provider), Path.Combine("/usr/local/bin", provider) }.FirstOrDefault(File.Exists);
         var home = StoreSecurity.UserProfile;
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         return Engine.FindOnPath(provider + ".exe")
