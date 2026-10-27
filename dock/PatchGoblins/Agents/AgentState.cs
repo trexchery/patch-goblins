@@ -264,6 +264,10 @@ public sealed class AgentStore(string root)
     public string RunFile(RepoAgents repo, WorkItem item, int attempt, string kind) =>
         System.IO.Path.Combine(RunDir(repo, item), $"{kind}-{attempt}.{(kind == "out" ? "jsonl" : kind == "prompt" ? "md" : "log")}");
 
-    public static string KeyFor(string path) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(System.IO.Path.GetFullPath(path).TrimEnd('\\', '/').ToLowerInvariant())))[..6].ToLowerInvariant();
+    public static string KeyFor(string path)
+    {
+        var full = System.IO.Path.GetFullPath(path).TrimEnd('\\', '/');
+        if (OperatingSystem.IsWindows()) full = full.ToLowerInvariant();
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full))))[..6].ToLowerInvariant();
+    }
 }

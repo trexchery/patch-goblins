@@ -77,6 +77,17 @@ public static class AgentsTerminal
         var script = Path.Combine(dir, "mascot.js");
         using (var s = typeof(AgentsTerminal).Assembly.GetManifestResourceStream("mascot.js")!)
         using (var f = File.Create(script)) s.CopyTo(f);
+        if (!OperatingSystem.IsWindows() && script.Contains(' '))
+        {
+            // Application Support always has a space. A private no-space copy
+            // keeps Bun's preload option valid without changing its parser.
+            var preload = Path.Combine("/tmp", "patch-goblins-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(preload, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var copy = Path.Combine(preload, "mascot.js");
+            File.Copy(script, copy);
+            File.SetUnixFileMode(copy, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            script = copy;
+        }
         var path = script.Contains(' ') && OperatingSystem.IsWindows() ? ShortPath(script) : script;
         if (path == null || path.Contains(' ')) return new Dictionary<string, string>();
         var had = Environment.GetEnvironmentVariable("BUN_OPTIONS");

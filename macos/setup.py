@@ -7,7 +7,7 @@ from setuptools import setup
 ROOT = Path(__file__).resolve().parent.parent
 setup(
     name="Patch Goblins",
-    version="0.6.1",
+    version="0.7.0",
     app=[str(ROOT / "macos" / "main.py")],
     options={
         "py2app": {
@@ -28,7 +28,7 @@ setup(
                 "CFBundleName": "Patch Goblins",
                 "CFBundleDisplayName": "Patch Goblins",
                 "CFBundleIdentifier": "com.patchgoblins.app",
-                "CFBundleShortVersionString": "0.6.1",
+                "CFBundleShortVersionString": "0.7.0",
                 "LSUIElement": True,
                 "LSMinimumSystemVersion": "12.0",
                 "NSHighResolutionCapable": True,

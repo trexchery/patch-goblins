@@ -14,6 +14,8 @@ PYTHON="${PATCH_GOBLINS_PYTHON:-python3.12}"
 command -v "$PYTHON" >/dev/null || { echo "Install a framework Python 3.12, e.g. brew install python@3.12" >&2; exit 1; }
 BUILD="$ROOT/build/macos"
 mkdir -p "$BUILD" "$ROOT/dist"
+# Clean only these generated subdirectories, so rebuilds cannot retain old code.
+rm -rf "$BUILD/py2app" "$BUILD/dist"
 # The lock includes all transitive Python and Objective-C dependencies.
 UV_PROJECT_ENVIRONMENT="$BUILD/venv" uv sync --locked --python "$PYTHON" --group macos-build --extra menubar --no-editable
 PY="$BUILD/venv/bin/python"
@@ -42,8 +44,7 @@ fi
 chmod +x "$APP/Contents/Resources/backend/patch-goblins-backend" "$APP/Contents/MacOS/cswap"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
-"$APP/Contents/MacOS/cswap" --version
-"$APP/Contents/Resources/backend/patch-goblins-backend" --help
+"$PY" macos/smoke.py "$APP"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ROOT/dist/patch-goblins-macos-arm64.zip"
 STAGE="$(mktemp -d "$BUILD/dmg.XXXXXX")"
 trap 'rmdir "$STAGE" 2>/dev/null || true' EXIT

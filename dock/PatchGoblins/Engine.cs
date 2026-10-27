@@ -337,6 +337,9 @@ public sealed partial class Engine(string exe)
         var script = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".command");
         var scriptText = new StringBuilder("#!/bin/zsh\n");
         scriptText.Append("cd -- ").Append(PosixQuote(cwd ?? StoreSecurity.UserProfile)).Append(" || exit\n");
+        foreach (var key in new[] { "PATH", "PATCH_GOBLINS_DATA", "PATCH_GOBLINS_ENGINE", "PATCH_GOBLINS_ENGINE_ARGS", "PATCH_GOBLINS_PYTHON", "PATCH_GOBLINS_PYTHON_ARGS", "PATCH_GOBLINS_APP_EXECUTABLE" })
+            if (Environment.GetEnvironmentVariable(key) is { } value)
+                scriptText.Append("export ").Append(key).Append('=').Append(PosixQuote(value)).Append('\n');
         foreach (var name in SessionMarkers(Environment.GetEnvironmentVariables().Keys.OfType<string>()))
             scriptText.Append("unset ").Append(name).Append('\n');
         foreach (var (key, value) in env ?? new Dictionary<string, string>())
@@ -344,7 +347,7 @@ public sealed partial class Engine(string exe)
             if (!Regex.IsMatch(key, "^[A-Za-z_][A-Za-z0-9_]*$")) throw new ArgumentException("Invalid terminal environment name");
             scriptText.Append("export ").Append(key).Append('=').Append(PosixQuote(value)).Append('\n');
         }
-        var prefix = exe == Locate().Exe ? PrefixArgs : [];
+        var prefix = exe == DockSettings.Env("ENGINE") ? PrefixArgs : [];
         scriptText.Append("rm -- ").Append(PosixQuote(script)).Append('\n');
         scriptText.Append(string.Join(' ', new[] { exe }.Concat(prefix).Concat(args).Select(PosixQuote))).Append('\n');
         File.WriteAllText(script, scriptText.ToString());

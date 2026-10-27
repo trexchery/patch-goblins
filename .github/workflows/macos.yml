@@ -30,6 +30,10 @@ jobs:
           uv run --python python3.12 pytest -n 3 -o faulthandler_timeout=600
       - name: Shared orchestration and process lifecycle
         run: dotnet test dock/PatchGoblins.Backend.Tests/PatchGoblins.Backend.Tests.csproj --nologo --logger 'trx;LogFileName=macos-backend.trx'
+      - name: Real desktop executable, private IPC, and owner approvals
+        env:
+          PATCH_GOBLINS_TEST_BACKEND: ${{ github.workspace }}/dock/PatchGoblins.Backend/bin/Debug/net8.0/patch-goblins-backend
+        run: uv run pytest tests/test_backend_host.py -n 0
       - name: Build standalone app, installer images, and executable smoke checks
         run: bash macos/build-macos.sh
       - name: Upload Apple Silicon application

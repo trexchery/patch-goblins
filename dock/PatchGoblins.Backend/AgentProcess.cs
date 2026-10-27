@@ -27,7 +27,7 @@ public sealed class AgentProcess : IDisposable
         this.record = record;
         this.outlive = outlive;
         Pid = process.Id;
-        CreatedTicks = process.StartTime.ToUniversalTime().Ticks;
+        CreatedTicks = Identity(process);
     }
 
     static string Record(string job) => Path.Combine(DockSettings.Dir, "processes",
@@ -47,6 +47,7 @@ public sealed class AgentProcess : IDisposable
         var record = Record(jobName);
         Directory.CreateDirectory(Path.GetDirectoryName(record)!);
         File.SetUnixFileMode(Path.GetDirectoryName(record)!, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        if (RecordIsLive(record)) throw new EngineException("This worker job is already running");
         var python = DockSettings.Env("PYTHON") ?? Engine.FindOnPath("python3")
             ?? throw new EngineException("Bundled Python runtime is unavailable");
         var helper = Path.Combine(AppContext.BaseDirectory, "worker_host.py");
@@ -60,8 +61,8 @@ public sealed class AgentProcess : IDisposable
         var process = Process.Start(psi) ?? throw new EngineException("Could not start worker host");
         var adapter = new AgentProcess(process, record, outlive);
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (!File.Exists(record) && !process.HasExited && DateTime.UtcNow < deadline) Thread.Sleep(10);
-        if (!File.Exists(record))
+        while (!Ready(record, process.Id) && !process.HasExited && DateTime.UtcNow < deadline) Thread.Sleep(10);
+        if (!Ready(record, process.Id))
         {
             try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
             adapter.Dispose();
@@ -77,7 +78,7 @@ public sealed class AgentProcess : IDisposable
         try
         {
             process = Process.GetProcessById(pid);
-            if (process.HasExited || process.StartTime.ToUniversalTime().Ticks != createdTicks) { process.Dispose(); return null; }
+            if (process.HasExited || Identity(process) != createdTicks) { process.Dispose(); return null; }
             var path = Record(jobName);
             using var state = JsonDocument.Parse(File.ReadAllText(path));
             if (state.RootElement.GetProperty("pid").GetInt32() != pid) { process.Dispose(); return null; }
@@ -187,10 +188,11 @@ public sealed class AgentProcess : IDisposable
         // Guard against PID reuse before signalling the stored process group.
         try
         {
-            if (!process.HasExited && process.StartTime.ToUniversalTime().Ticks != CreatedTicks) return;
+            try { using var current = Process.GetProcessById(Pid); if (Identity(current) != CreatedTicks) return; }
+            catch (ArgumentException) { } // the old leader exited; clean its remaining group
             KillGroup(Pid, 9);
         }
-        catch (Exception e) when (e is ArgumentException or InvalidOperationException or Win32Exception) { }
+        catch (Exception e) when (e is ArgumentException or IOException or InvalidOperationException or Win32Exception) { }
     }
 
     public async Task ReapAsync()
@@ -209,6 +211,31 @@ public sealed class AgentProcess : IDisposable
     }
 
     public static long UnbiasedMilliseconds => Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency;
+    static long Identity(Process process)
+    {
+        if (!OperatingSystem.IsLinux()) return process.StartTime.ToUniversalTime().Ticks;
+        var stat = File.ReadAllText($"/proc/{process.Id}/stat");
+        var fields = stat[(stat.LastIndexOf(')') + 1)..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return long.Parse(fields[19], System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    static bool Ready(string path, int pid)
+    {
+        try { using var state = JsonDocument.Parse(File.ReadAllText(path)); return state.RootElement.GetProperty("pid").GetInt32() == pid; }
+        catch (Exception e) when (e is IOException or JsonException or KeyNotFoundException) { return false; }
+    }
+
+    static bool RecordIsLive(string path)
+    {
+        try
+        {
+            using var state = JsonDocument.Parse(File.ReadAllText(path));
+            using var existing = Process.GetProcessById(state.RootElement.GetProperty("pid").GetInt32());
+            var started = DateTimeOffset.FromUnixTimeMilliseconds((long)(state.RootElement.GetProperty("started").GetDouble() * 1000));
+            return !existing.HasExited && Math.Abs((existing.StartTime.ToUniversalTime() - started.UtcDateTime).TotalSeconds) <= 2;
+        }
+        catch (Exception e) when (e is ArgumentException or IOException or JsonException or InvalidOperationException or Win32Exception) { return false; }
+    }
     static void Kill(int pid, int signal) { if (pid > 1) kill(pid, signal); }
     static void KillGroup(int group, int signal) { if (group > 1 && group != Environment.ProcessId) kill(-group, signal); }
     [DllImport("libc", SetLastError = true)] static extern int kill(int pid, int signal);

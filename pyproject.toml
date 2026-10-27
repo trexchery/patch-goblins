@@ -43,6 +43,7 @@ Issues = "https://github.com/trexchery/patch-goblins/issues"
 [project.scripts]
 claude-swap = "claude_swap.cli:main"
 cswap = "claude_swap.cli:main"
+patch-goblins = "claude_swap.goblins:main"
 
 [build-system]
 requires = ["hatchling"]

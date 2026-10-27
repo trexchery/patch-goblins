@@ -166,3 +166,39 @@ def test_official_login_is_isolated_and_secret_overrides_removed(monkeypatch, te
     assert captured["CLAUDE_CONFIG_DIR"] == captured["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
     assert not Path(captured["CLAUDE_CONFIG_DIR"]).exists()
     assert enroll.call_args.args[1] == captured["CLAUDE_CONFIG_DIR"]
+
+
+@pytest.mark.asyncio
+async def test_work_dashboard_runs_tools_and_releases_repository_lease(monkeypatch, tmp_path):
+    from claude_swap.goblins_ui import GoblinsApp
+    calls = []
+    class InputPipe:
+        def __init__(self):
+            self.closed = False
+        def close(self):
+            self.closed = True
+    class Process:
+        def __init__(self, lease=False):
+            self.stdin = InputPipe()
+            self.returncode = None if lease else 0
+        async def communicate(self):
+            return b"Synthetic agent status", b""
+        async def wait(self):
+            self.returncode = 0
+            return 0
+        def terminate(self):
+            self.returncode = -15
+    lease = Process(True)
+    async def create(*argv, **kwargs):
+        calls.append(argv)
+        return lease if "agents-mcp" in argv else Process()
+    monkeypatch.setattr("claude_swap.goblins_ui.backend_command", lambda: ["synthetic-backend"])
+    monkeypatch.setattr("claude_swap.goblins_ui.asyncio.create_subprocess_exec", create)
+    app = GoblinsApp(str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.click("#pause")
+        await pilot.pause()
+        assert any("agents-mcp" in call for call in calls)
+        assert any("agents_control" in call and '{"action": "pause"}' in call for call in calls)
+    assert lease.stdin.closed

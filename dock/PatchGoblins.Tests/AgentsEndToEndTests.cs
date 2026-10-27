@@ -1144,7 +1144,8 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("\"os\"", refused);
         Assert.False(await On(r => r?.Authorized ?? false));
         // Marked for the system it was written for, it is skipped here, as policy checks for another system always were.
-        CommitPolicy("""{"version":1,"checks":[{"run":"CI=1 git --version","os":"linux"}]}""");
+        var foreignOs = OperatingSystem.IsLinux() ? "macos" : "linux";
+        CommitPolicy(JsonSerializer.Serialize(new { version = 1, checks = new[] { new { run = "CI=1 git --version", os = foreignOs } } }));
         Assert.StartsWith("Nothing started: The command `export CI=1", await Tool("agents_control", """{"action":"start","verify":"export CI=1 && git --version"}"""));
         Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start","verify":"set CI=1&& git --version"}"""));
         _sup!.Dispose();
@@ -1472,13 +1473,14 @@ public sealed class AgentsEndToEndTests : IDisposable
     [Fact]
     public async Task ASensitiveChangeGetsAnAdversarialReviewAndWaitsForTheOwnerEvenAcrossARestart()
     {
-        CommitPolicy("""{"version":1,"sensitive":["deploy/**"],"checks":[{"run":"git --version","paths":["issue-*.txt"]},{"run":"exit 1","paths":["never/**"]},{"run":"exit 1","os":"linux"}]}""");
+        var foreignOs = OperatingSystem.IsLinux() ? "macos" : "linux";
+        CommitPolicy("""{"version":1,"sensitive":["deploy/**"],"checks":[{"run":"git --version","paths":["issue-*.txt"]},{"run":"exit 1","paths":["never/**"]},{"run":"exit 1","os":"OTHER_OS"}]}""".Replace("OTHER_OS", foreignOs));
         Issues("""[{"number":50,"title":"Deploy script","body":"[fake:touch=deploy/run.txt] Add it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         await StartAsync();
         string? shown = null;
         await _loop.Run(() => { _sup!.Authorize = (_, v, _) => { shown = v; return Task.FromResult(true); }; return 0; });
         Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
-        Assert.Equal("`git --version` when issue-*.txt change\n`exit 1` when never/** change\n`exit 1` (linux only)", shown); // the owner confirms the policy's checks
+        Assert.Equal($"`git --version` when issue-*.txt change\n`exit 1` when never/** change\n`exit 1` ({foreignOs} only)", shown); // the owner confirms the policy's checks
 
         await Until(r => Item(r, 50) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the sensitive change waits for the owner");
         Assert.DoesNotContain("patch-goblins/50", Git(_repo, "ls-remote", "origin"));
@@ -1499,7 +1501,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 50).State == ItemState.Open, "the owner's yes pushes it");
         var body = Read(Path.Combine(_gh, "pr-body-7.md"));
         Assert.Contains("passed: `git --version` at", body); // selected by the changed paths
-        Assert.Contains("not run here: `exit 1` needs linux", body); // covers the change, but proves nothing here
+        Assert.Contains($"not run here: `exit 1` needs {foreignOs}", body); // covers the change, but proves nothing here
         Assert.DoesNotContain("never/**", body);
         Assert.Contains("pushed with the owner's approval", body);
 
