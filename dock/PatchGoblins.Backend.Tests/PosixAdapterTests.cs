@@ -9,6 +9,24 @@ namespace PatchGoblins.Tests;
 public sealed class PosixAdapterTests
 {
     [Fact]
+    public void HardeningRetainsWorktreeExecutablesAndDoesNotFollowLinks()
+    {
+        using var temp = new TempDir();
+        var data = Path.Combine(temp.Path, "data");
+        Directory.CreateDirectory(data);
+        var executable = Path.Combine(data, "verify.sh");
+        File.WriteAllText(executable, "#!/bin/sh\nexit 0\n");
+        File.SetUnixFileMode(executable, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        var outside = Path.Combine(temp.Path, "outside");
+        File.WriteAllText(outside, "synthetic");
+        File.SetUnixFileMode(outside, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.OtherRead);
+        File.CreateSymbolicLink(Path.Combine(data, "link"), outside);
+        StoreSecurity.Harden(data);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(executable));
+        Assert.True(File.GetUnixFileMode(outside).HasFlag(UnixFileMode.OtherRead));
+    }
+
+    [Fact]
     public async Task AStaleJobRecordCannotMakeANewLaunchReady()
     {
         using var tmp = new TempDir();

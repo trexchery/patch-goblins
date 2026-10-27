@@ -212,6 +212,8 @@ def add_account() -> str:
 
 
 class MenuExtension:
+    hosts_auto_switch = True
+
     def __init__(self):
         self.client = BackendClient()
         self.snapshot: dict = {}

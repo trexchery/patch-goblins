@@ -12,6 +12,7 @@ internal sealed partial class BackendUpkeep : IDisposable
     readonly Func<Snapshot?> snapshot;
     readonly Action<string, string> notify;
     readonly Func<Task> refresh;
+    readonly SynchronizationContext context;
     readonly QuotaAlerts alerts = new();
     readonly SwitchLine switchLine = new();
     readonly Primer primer = new(Primer.DefaultPath);
@@ -22,7 +23,9 @@ internal sealed partial class BackendUpkeep : IDisposable
     readonly string movesPath = Path.Combine(DockSettings.Dir, "resumed.json");
     readonly LimitWatch watch;
     readonly LimitSwitch limits;
-    DateTimeOffset lastConfig, lastPrime;
+    DateTimeOffset lastConfig, lastPrime, lastAuto;
+    Task? autoTask;
+    CancellationTokenSource? autoCancel;
     double? threshold;
     double hysteresis = 10;
     bool ticking, disposed;
@@ -30,12 +33,22 @@ internal sealed partial class BackendUpkeep : IDisposable
     public double EffectiveThreshold => settings.AutoLine && snapshot()?.Accounts.FirstOrDefault(a => a.Active) is { } active
         ? switchLine.For(active, null) : threshold ?? 97;
 
+    public void SettingsChanged()
+    {
+        if (!settings.AutoSwitch) autoCancel?.Cancel();
+    }
+
     public BackendUpkeep(Engine engine, DockSettings settings, Func<Snapshot?> snapshot,
         Action<string, string> notify, Func<Task> refresh)
     {
         (this.engine, this.settings, this.snapshot, this.notify, this.refresh) = (engine, settings, snapshot, notify, refresh);
+        context = SynchronizationContext.Current ?? throw new InvalidOperationException("Desktop upkeep needs the host context");
         moves = ResumeStopped.LoadMoves(movesPath);
-        watch = new(hits.Enqueue, Program.Log);
+        watch = new(hit =>
+        {
+            try { context.Post(_ => _ = HandleLimitAsync(hit), null); }
+            catch (Exception error) when (error is InvalidOperationException or ObjectDisposedException) { }
+        }, Program.Log);
         limits = new(snapshot, ResumeStopped.DefaultLogin, LiveOrLaunching,
             engine.ImportUsageAsync, engine.SwitchNowAsync, reported, Program.Log,
             threshold: () => EffectiveThreshold, hysteresis: () => hysteresis);
@@ -54,6 +67,7 @@ internal sealed partial class BackendUpkeep : IDisposable
         ticking = true;
         try
         {
+            SettingsChanged();
             var notices = alerts.Observe("claude", snap.Accounts);
             switchLine.Observe(snap.Accounts, DateTimeOffset.Now);
             supervisor.Config.Threshold = EffectiveThreshold;
@@ -69,6 +83,14 @@ internal sealed partial class BackendUpkeep : IDisposable
             }
             if ((settings.AutoSwitch || settings.AutoPrime) && now - lastConfig > TimeSpan.FromMinutes(3))
                 await ReadConfigAsync();
+            if (settings.AutoSwitch && threshold != null && (autoTask == null || autoTask.IsCompleted)
+                && now - lastAuto >= TimeSpan.FromSeconds(30))
+            {
+                lastAuto = now;
+                autoCancel?.Dispose();
+                autoCancel = new CancellationTokenSource();
+                autoTask = AutoAsync(autoCancel.Token); // buffering never blocks the API-error watcher
+            }
             if (settings.AutoPrime)
             {
                 if (primer.Observe(snap.Accounts, now)) primer.Save();
@@ -96,18 +118,7 @@ internal sealed partial class BackendUpkeep : IDisposable
             var dirs = ResumeStopped.ConfigDirs(snap.ActiveAccountNumber);
             watch.Sync(dirs.Select(d => d.Dir));
             await Task.Run(() => watch.Poll(ResumeStopped.LiveTranscripts(dirs, DateTime.UtcNow)));
-            while (hits.TryDequeue(out var hit))
-            {
-                if (!settings.AutoSwitch || disposed) return;
-                if (ResumeStopped.AgentSession(hit.ConfigDir, hit.File) is { } parent) agentLimits[parent] = hit.Limit;
-                var outcome = await limits.OnLimitAsync(hit);
-                if (outcome?.Switched is { Switched: true } switched)
-                {
-                    notify("Account switched", Format.SwitchNotice(switched.From, switched.To));
-                    await refresh();
-                }
-                else if (outcome?.Error is { } error && told.Add(error)) notify("Auto-switch needs attention", error);
-            }
+            while (hits.TryDequeue(out var hit)) await HandleLimitAsync(hit);
             if (await FreePinnedAsync(supervisor, snapshot() ?? snap)) { await refresh(); return; }
             await ResumeAsync(snapshot() ?? snap);
         }
@@ -118,12 +129,37 @@ internal sealed partial class BackendUpkeep : IDisposable
     async Task ReadConfigAsync()
     {
         var config = await engine.ConfigAsync();
+        ApplyEngineConfig(config);
+    }
+
+    public void ApplyEngineConfig(IReadOnlyDictionary<string, string?> config)
+    {
         if (!double.TryParse(config.GetValueOrDefault("autoswitch.threshold"), NumberStyles.Float, CultureInfo.InvariantCulture, out var line)) return;
         threshold = line;
         if (double.TryParse(config.GetValueOrDefault("autoswitch.hysteresisPct"), NumberStyles.Float, CultureInfo.InvariantCulture, out var h)) hysteresis = h;
         ResumeStopped.Models = (config.GetValueOrDefault("autoswitch.model") ?? "")
             .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.OrdinalIgnoreCase);
         lastConfig = DateTimeOffset.Now;
+    }
+
+    async Task HandleLimitAsync(LimitHit hit)
+    {
+        if (!settings.AutoSwitch || disposed) return;
+        if (snapshot() == null || threshold == null) { hits.Enqueue(hit); return; }
+        try
+        {
+            if (ResumeStopped.AgentSession(hit.ConfigDir, hit.File) is { } parent) agentLimits[parent] = hit.Limit;
+            var outcome = await limits.OnLimitAsync(hit); // immediate, never queued behind an auto-switch buffer
+            if (outcome?.Switched is { Switched: true } switched)
+            {
+                notify("Account switched", Format.SwitchNotice(switched.From, switched.To));
+                await refresh();
+            }
+            else if (outcome?.Error is { } error && told.Add(error)) notify("Auto-switch needs attention", error);
+            else if (outcome is { NoRoom: true } && told.Add("no-room:" + outcome.Earliest))
+                notify("All accounts near their limits", outcome.Earliest is { } reset ? "Earliest reset " + Format.When(reset, DateTimeOffset.Now) : "No reset time known.");
+        }
+        catch (Exception error) { Program.Log(error); }
     }
 
     async Task ResumeAsync(Snapshot snap)
@@ -161,7 +197,7 @@ internal sealed partial class BackendUpkeep : IDisposable
             await Task.Run(Copy); // a failed copy closes nothing
             if (!settings.AutoSwitch || disposed || !ResumeStopped.Unchanged(stop)
                 || ResumeStopped.UserIdle() < (stop.AtLimit ? TimeSpan.FromSeconds(5) : TimeSpan.FromSeconds(60))
-                || !ResumeStopped.SafeToClose(number, limits.RefusedUntil, limits.Switching,
+                || !ResumeStopped.SafeToClose(number, limits.RefusedUntil, limits.Switching || autoTask is { IsCompleted: false },
                     login.Account, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow)) continue;
             moves[key] = DateTime.UtcNow;
             ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); // failure here closes nothing
@@ -186,5 +222,26 @@ internal sealed partial class BackendUpkeep : IDisposable
         }
     }
 
-    public void Dispose() { disposed = true; watch.Dispose(); }
+    async Task AutoAsync(CancellationToken cancellation)
+    {
+        try
+        {
+            var (_, events) = await engine.AutoOnceAsync(EffectiveThreshold, cancellation);
+            if (disposed || cancellation.IsCancellationRequested) return;
+            foreach (var ev in events)
+            {
+                if (ev is { Event: "switch", DryRun: false })
+                    notify("Account switched", Format.SwitchNotice(ev.From, ev.To));
+                else if (ev.Event is "account-quarantined" or "all-exhausted" or "config-warning" or "error")
+                {
+                    var text = ev.Message ?? ev.Detail ?? ev.Reason ?? ev.Event;
+                    if (told.Add(ev.Event + ":" + text)) notify("Auto-switch", text);
+                }
+            }
+            await refresh();
+        }
+        catch (Exception error) { if (!cancellation.IsCancellationRequested) Program.Log(error); }
+    }
+
+    public void Dispose() { disposed = true; autoCancel?.Cancel(); watch.Dispose(); }
 }

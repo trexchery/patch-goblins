@@ -20,7 +20,6 @@ setup(
             "extra_scripts": [str(ROOT / "macos" / "cswap.py")],
             "iconfile": str(ROOT / "build" / "macos" / "goblin.icns"),
             "resources": [
-                str(ROOT / "build" / "macos" / "backend"),
                 str(ROOT / "assets" / "goblin.png"),
                 str(ROOT / "LICENSE"),
             ],

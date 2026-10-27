@@ -144,11 +144,11 @@ public sealed partial class Engine(string exe)
     /// One auto-switch tick. The engine owns thresholds, cooldown, hysteresis,
     /// quarantine and the disabled/API-key exclusions; exit 0=switched 2=no-op 3=blocked.
     /// `threshold`: this tick's line instead of the engine's saved one (the tray's automatic line).
-    public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync(double? threshold = null)
+    public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync(double? threshold = null, CancellationToken ct = default)
     {
         var r = await RunAsync(threshold is { } t
             ? ["auto", "--once", "--json", "--threshold", t.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)]
-            : ["auto", "--once", "--json"]);
+            : ["auto", "--once", "--json"], TimeSpan.FromSeconds(360), ct: ct);
         return (r.ExitCode, ParseEvents(r.Stdout));
     }
 

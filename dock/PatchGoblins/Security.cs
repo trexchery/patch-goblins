@@ -29,7 +29,7 @@ public static class StoreSecurity
             foreach (var item in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }))
                 File.SetUnixFileMode(item.FullName, item is DirectoryInfo
                     ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-                    : UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                    : UnixFileMode.UserRead | UnixFileMode.UserWrite | (File.GetUnixFileMode(item.FullName) & UnixFileMode.UserExecute));
             return;
         }
         var sec = new DirectorySecurity();

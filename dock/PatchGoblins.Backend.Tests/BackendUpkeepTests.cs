@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using PatchGoblins;
 using Xunit;
 
@@ -6,72 +7,46 @@ namespace PatchGoblins.Tests;
 public sealed class BackendUpkeepTests
 {
     [Fact]
-    public async Task DefaultUpkeepNeverInvokesCredentialEngineOrTouchesSessions()
+    public async Task AnUnknownHeadlessRunKeepsItsProfileAndIsNeverTerminated()
     {
-        using var temp = new TempDir();
-        var before = Environment.GetEnvironmentVariable("PATCH_GOBLINS_DATA");
-        var context = SynchronizationContext.Current;
-        Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", temp.Path);
-        SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
+        using var tmp = new TempDir();
+        using var loop = new Loop();
+        var oldHome = Environment.GetEnvironmentVariable("HOME");
+        var oldData = Environment.GetEnvironmentVariable("PATCH_GOBLINS_DATA");
+        Environment.SetEnvironmentVariable("HOME", tmp.Path);
+        Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", Path.Combine(tmp.Path, "desktop"));
+        using var unknown = Process.Start(new ProcessStartInfo("/bin/sh", ["-c", "sleep 60"])
+            { UseShellExecute = false })!;
         try
         {
-            var engine = new Engine(Path.Combine(temp.Path, "must-never-run"));
-            var settings = new DockSettings { AgentSummaryAt = DateTimeOffset.Now };
-            Snapshot current = new(1, 1, [Account(10)]);
+            var markerDir = Path.Combine(StoreSecurity.BackupRoot, "sessions", "2-spare", ".cswap-runs");
+            Directory.CreateDirectory(markerDir);
+            File.WriteAllText(Path.Combine(markerDir, unknown.Id.ToString()), "");
+            var reset = DateTimeOffset.Now.AddHours(2);
+            Account A(int n, double quota, bool active) => new(n, $"synthetic{n}@example.invalid", active, "ok",
+                new Usage(new Window(quota, reset), new Window(quota, reset), null, null));
+            var snapshot = new Snapshot(1, 1, [A(1, 100, true), A(2, 10, false)]);
             var notices = new List<string>();
-            var refreshes = 0;
-            using var supervisor = new Supervisor(engine, new Cli("must-never-git", null), new AgentStore(Path.Combine(temp.Path, "agents")), new AgentsConfig());
-            using var upkeep = new BackendUpkeep(engine, settings, () => current, (_, text) => notices.Add(text), () => { refreshes++; return Task.CompletedTask; });
-            await upkeep.TickAsync(supervisor);
-            current = current with { Accounts = [Account(100)] };
-            await upkeep.TickAsync(supervisor);
-            Assert.Empty(notices);
-            Assert.Equal(0, refreshes);
-            Assert.False(File.Exists(Path.Combine(temp.Path, "prime.json")));
-            Assert.False(File.Exists(Path.Combine(temp.Path, "resumed.json")));
+            Assert.Contains(2, ResumeStopped.LiveProfiles(ResumeStopped.ConfigDirs(1)));
+            await loop.Run(async () =>
+            {
+                using var supervisor = new Supervisor(new Engine("/bin/true"), new Cli("/usr/bin/git", null),
+                    new AgentStore(Path.Combine(tmp.Path, "agents")), new AgentsConfig());
+                using var upkeep = new BackendUpkeep(new Engine("/bin/true"), new DockSettings { AutoSwitch = true, AutoLine = false },
+                    () => snapshot, (_, text) => notices.Add(text), () => Task.CompletedTask);
+                Assert.False(await upkeep.FreePinnedAsync(supervisor, snapshot));
+                Assert.Equal(0, supervisor.RunsOn(snapshot.Accounts[1]));
+                return true;
+            });
+            Assert.False(unknown.HasExited);
+            Assert.Contains(notices, text => text.Contains("headless", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
-            Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", before);
-            SynchronizationContext.SetSynchronizationContext(context);
+            if (!unknown.HasExited) unknown.Kill(entireProcessTree: true);
+            await unknown.WaitForExitAsync();
+            Environment.SetEnvironmentVariable("HOME", oldHome);
+            Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", oldData);
         }
     }
-
-    [Fact]
-    public async Task QuotaOptInReusesCrossingPolicyAndStaleReadingsNeverResetIt()
-    {
-        using var temp = new TempDir();
-        var before = Environment.GetEnvironmentVariable("PATCH_GOBLINS_DATA");
-        var context = SynchronizationContext.Current;
-        Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", temp.Path);
-        SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
-        try
-        {
-            var engine = new Engine("must-never-run");
-            var settings = new DockSettings { AgentSummaryAt = DateTimeOffset.Now, QuotaNotifications = true };
-            Snapshot current = new(1, 1, [Account(10)]);
-            var notices = new List<string>();
-            using var supervisor = new Supervisor(engine, new Cli("must-never-git", null), new AgentStore(Path.Combine(temp.Path, "agents")), new AgentsConfig());
-            using var upkeep = new BackendUpkeep(engine, settings, () => current, (_, text) => notices.Add(text), () => Task.CompletedTask);
-            await upkeep.TickAsync(supervisor);
-            current = current with { Accounts = [Account(100)] };
-            await upkeep.TickAsync(supervisor);
-            Assert.Single(notices);
-            Assert.Contains("limit reached", notices[0]);
-            current = current with { Accounts = [Account(0) with { UsageStatus = "unavailable" }] };
-            await upkeep.TickAsync(supervisor);
-            Assert.Single(notices);
-            current = current with { Accounts = [Account(0)] };
-            await upkeep.TickAsync(supervisor);
-            Assert.Equal(2, notices.Count);
-            Assert.Contains("reset", notices[1]);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", before);
-            SynchronizationContext.SetSynchronizationContext(context);
-        }
-    }
-
-    static Account Account(double percent) => new(1, "synthetic@example.com", true, "ok", new Usage(new Window(percent, null), null, null, null));
 }

@@ -7,7 +7,7 @@ internal sealed partial class BackendUpkeep
 
     /// The Windows tray's FreePinnedAsync flow, using the same account, idle,
     /// ownership and move guards. Only sessions already judged idle can close.
-    async Task<bool> FreePinnedAsync(Supervisor supervisor, Snapshot snap)
+    internal async Task<bool> FreePinnedAsync(Supervisor supervisor, Snapshot snap)
     {
         var due = ResumeStopped.FreeTargets(snap.Accounts, LiveOrLaunching(), limits.RefusedUntil,
             DateTimeOffset.UtcNow, EffectiveThreshold, hysteresis);
@@ -23,7 +23,8 @@ internal sealed partial class BackendUpkeep
         {
             if (heldProfiles.Add(number)) notify($"#{number} is held by a pinned terminal", message);
         }
-        if (disposed || !settings.AutoSwitch || ResumeStopped.ProfileDir(number) is not { } dir) return false;
+        if (disposed || !settings.AutoSwitch || limits.Switching || autoTask is { IsCompleted: false }
+            || ResumeStopped.ProfileDir(number) is not { } dir) return false;
         if (freed.TryGetValue(number, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(30))
         {
             Held($"#{number} was freed under half an hour ago and is in use again. It is not freed repeatedly.");
@@ -71,7 +72,7 @@ internal sealed partial class BackendUpkeep
         {
             foreach (var window in windows)
             {
-                if (disposed || !settings.AutoSwitch || !ResumeStopped.Unchanged(window)
+                if (disposed || !settings.AutoSwitch || limits.Switching || autoTask is { IsCompleted: false } || !ResumeStopped.Unchanged(window)
                     || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)) break;
                 if (window.Limit is { } old) watch.Remember(old.At);
                 await ResumeStopped.CloseAsync(window.Pid, window.Record);
@@ -86,7 +87,7 @@ internal sealed partial class BackendUpkeep
             var free = false;
             for (var attempt = 0; attempt < 60 && !(free = await Task.Run(() => ResumeStopped.LiveProfiles([(dir, number)]).Count == 0)); attempt++)
                 await Task.Delay(500);
-            if (free && !disposed && settings.AutoSwitch)
+            if (free && !disposed && settings.AutoSwitch && !limits.Switching && autoTask is not { IsCompleted: false })
                 switched = await engine.SwitchNowAsync(number);
         }
         catch (Exception error) { Program.Log(error); }

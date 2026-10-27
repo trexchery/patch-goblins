@@ -677,6 +677,8 @@ def run(switcher, *, extension=None, app_name="claude-swap", icon=None) -> int:
         # ---- auto-switch engine ----------------------------------------------
         def _start_engine(self):
             """Run the core AutoSwitchEngine (live) in a background thread."""
+            if extension is not None and getattr(extension, "hosts_auto_switch", False):
+                return  # the Patch Goblins backend calls this same engine through `auto --once`
             if self._engine is not None:
                 return
             try:

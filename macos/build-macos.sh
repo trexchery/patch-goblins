@@ -15,13 +15,13 @@ command -v "$PYTHON" >/dev/null || { echo "Install a framework Python 3.12, e.g.
 BUILD="$ROOT/build/macos"
 mkdir -p "$BUILD" "$ROOT/dist"
 # Clean only these generated subdirectories, so rebuilds cannot retain old code.
-rm -rf "$BUILD/py2app" "$BUILD/dist"
+rm -rf "$BUILD/py2app" "$BUILD/dist" "$BUILD/backend"
 # The lock includes all transitive Python and Objective-C dependencies.
 UV_PROJECT_ENVIRONMENT="$BUILD/venv" uv sync --locked --python "$PYTHON" --group macos-build --extra menubar --no-editable
 PY="$BUILD/venv/bin/python"
 dotnet publish dock/PatchGoblins.Backend/PatchGoblins.Backend.csproj \
     -c Release -r osx-arm64 --self-contained true \
-    -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+    -p:PublishSingleFile=false \
     --nologo -o "$BUILD/backend"
 ICONSET="$BUILD/goblin.iconset"
 mkdir -p "$ICONSET"
@@ -43,6 +43,9 @@ if [[ -f "$APP/Contents/MacOS/main" ]]; then
     mv "$APP/Contents/MacOS/main" "$APP/Contents/MacOS/Patch Goblins"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Patch Goblins' "$APP/Contents/Info.plist"
 fi
+# py2app's macholib must not rewrite .NET apphosts or runtime libraries.
+# Copy this self-contained runtime after Python's dependency relocation.
+ditto "$BUILD/backend" "$APP/Contents/Resources/backend"
 chmod +x "$APP/Contents/Resources/backend/patch-goblins-backend" "$APP/Contents/MacOS/cswap"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"

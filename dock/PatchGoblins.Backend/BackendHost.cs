@@ -66,9 +66,9 @@ internal sealed class BackendHost
         {
             stopping.Cancel();
             foreach (var answer in approvals.Values) answer.TrySetResult(false);
+            upkeep.Dispose();
             await supervisor.StopAllAsync();
             supervisor.Dispose();
-            upkeep.Dispose();
             try { await poll; } catch (OperationCanceledException) { }
             try { await maintenance; } catch (OperationCanceledException) { }
         }
@@ -166,6 +166,7 @@ internal sealed class BackendHost
             }
         }
         settings.Save();
+        upkeep.SettingsChanged();
         ApplySettings();
         supervisor.Poke();
         return settings;
@@ -187,10 +188,12 @@ internal sealed class BackendHost
         try
         {
             var config = await engine.ConfigAsync();
+            upkeep.ApplyEngineConfig(config);
             if (double.TryParse(config.GetValueOrDefault("autoswitch.threshold"), NumberStyles.Float, CultureInfo.InvariantCulture, out var threshold))
                 supervisor.Config.Threshold = threshold;
             supervisor.Config.ConsumeFirst = config.GetValueOrDefault("autoswitch.strategy") == "consume-first";
             accounts = await engine.ListAsync();
+            supervisor.Config.Threshold = upkeep.EffectiveThreshold;
             var dirs = ResumeStopped.ConfigDirs(accounts.ActiveAccountNumber);
             var live = await Task.Run(() => ResumeStopped.LiveProfiles(dirs));
             // Unreadable session state fails closed: never contend with the owner's solo account.
