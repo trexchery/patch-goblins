@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -779,7 +779,7 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
+        trouble — try again next tick). Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -787,12 +787,12 @@ class AutoSwitchEngine:
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
-            # profile. Auto-activating it as the default login too would put
-            # one rotating refresh token in two config dirs (the stale-copy
-            # failure class) with nobody reading the warning — and its quota
-            # is already being consumed by that session anyway. Manual
-            # switch_to keeps its warn-and-proceed behavior; auto skips.
-            return "skip-live-session"
+            # profile. A window at its limit has to move off its account, so
+            # auto switches here like a manual switch does (warn and proceed);
+            # the backup is not refreshed, because that would consume the
+            # grant the session holds. `switch_to` still refuses when the
+            # profile's credential is ahead of the backup (see the loop).
+            return "ok"
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:
             return "transient"
@@ -884,6 +884,11 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        if not self.dry_run:
+            try:
+                self.switcher.follow_logins()  # one login for the default login and its live window, see there
+            except Exception as e:  # pragma: no cover - never in the way of the tick
+                logging.getLogger("claude-swap").warning("follow_logins failed: %s", type(e).__name__)
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -1374,11 +1379,14 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
-                continue
-            return self._perform(
-                num, email, trigger, left_snapshot, entry, active_headroom
-            )
+            try:
+                return self._perform(
+                    num, email, trigger, left_snapshot, entry, active_headroom
+                )
+            except SwitchError:
+                if not self.switcher.live_session_pids_for(num, email):
+                    raise
+                continue  # its session profile is ahead of the backup: the next candidate
 
         if systemic or transient_failure:
             self._emit(

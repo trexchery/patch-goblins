@@ -482,11 +482,9 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task<(bool AtLimit, string Label)?> MoveAsync(StoppedSession s, Account account, string dir, int? login)
     {
-        var closed = false;
         try
         {
-            // Copied before the window closes (a failed copy leaves it untouched), then again after claude
-            // exits so nothing it writes on the way out is left behind.
+            // Copied before anything opens (a failed copy leaves the window untouched), then again just before the new window launches.
             // The default login can change hands before `cswap run` looks (the engine, a limit hit), and it then runs in ~/.claude
             // instead of the profile: the transcript is put where either would look.
             string[] dirs = [.. new[] { dir, ResumeStopped.DefaultDir, ResumeStopped.ProfileDir(account.Number) }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase)];
@@ -503,13 +501,12 @@ public sealed partial class TrayApp : ApplicationContext
                 Program.Log($"move {s.SessionId} to #{account.Number} dropped: the login or the limits moved since the plan");
                 return null;
             }
-            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the close, which can wait 30 s: a concurrent switch must not pick this account meanwhile
-            var spot = WindowSpot.Of(s.Pid); // the reopened window goes back where this one was
-            await ResumeStopped.CloseAsync(s.Pid, s.Record);
-            closed = true;
-            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); }
+            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the launch, which can wait 10 s: a concurrent switch must not pick this account meanwhile
+            var spot = WindowSpot.Of(s.Pid); // the new window opens where this one is, on top of it
+            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); } // what the transcript holds now: the new window then owns it
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
-            await WindowSpot.OpenAtAsync(spot, () =>
+            // The new window first, the old one only once it is up: a launch that fails leaves the old window as it was.
+            var up = await WindowSpot.OpenAtAsync(spot, () =>
             {
                 for (var attempt = 0; ; attempt++)
                 {
@@ -519,18 +516,24 @@ public sealed partial class TrayApp : ApplicationContext
                             Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s)));
                         break;
                     }
-                    catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more: the old window is already gone
+                    catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more
                 }
             });
+            // Someone typed or a turn started in the old window while the new one opened: it is not closed under them.
+            if (!up || !ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60))
+            {
+                Program.Log($"old window of {s.SessionId} kept: {(up ? "it was used while the new one opened" : "the new window was not seen")}");
+                Notify("Opened a new window; the old one is still open", $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} is on #{account.Number} in the new window. Close whichever you do not want.", ToolTipIcon.Warning);
+                return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
+            }
+            await ResumeStopped.CloseAsync(s.Pid, s.Record);
             Program.Log($"nudge {s.SessionId} relaunched #{s.Account} on #{account.Number}");
             return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
         }
         catch (Exception e)
         {
             Program.Log(e);
-            // The window is gone and no record is left for a later pass: the owner gets the line that brings it back (no secrets in it).
-            if (closed) Notify("Could not reopen a stopped window", $"In {s.Cwd}: cswap run {account.Number} -- --resume {s.SessionId}", ToolTipIcon.Warning);
-            else Error("Could not reopen a stopped window", e);
+            Error("Could not reopen a stopped window", e); // the old window is still there: nothing closed before the new one was up
             return null;
         }
     }

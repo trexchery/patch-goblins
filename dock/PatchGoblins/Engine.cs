@@ -114,8 +114,8 @@ public sealed partial class Engine(string exe)
     /// The two calls a usage-limit error makes, not queued behind the gate (an `auto --once` can hold it for ~30 s). Safe:
     /// the engine serializes what it mutates itself, as it must for several terminals (the store's FileLock, Claude Code's
     /// credential lock; `import-usage` under the usage store's), so only the call order is ours.
-    /// `--exclusive`: unattended, so the engine refuses an account a `cswap run` window holds rather than warn nobody.
-    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json", "--exclusive"], gated: false);
+    /// Not `--exclusive`: an account a `cswap run` window holds is still switched to (the engine warns; it refuses only when that profile's login is ahead).
+    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json"], gated: false);
 
     public async Task ImportUsageAsync(string document)
     {

@@ -28,11 +28,11 @@ public sealed record WindowSpot(int Left, int Top, int Right, int Bottom, bool M
         catch (Exception e) { Program.Log(e); return null; } // never in the way of a move
     }
 
-    /// Runs `launch`, which opens one terminal window, and puts that window at `spot`. Null: only launches.
+    /// Runs `launch`, which opens one terminal window, and puts that window at `spot` (null: left where it opens).
+    /// True once the new window is up, so a caller can then close the one it replaces; false when none showed within ~10 s.
     // ponytail: the new window is the first terminal window that was not there before; one opened by hand in the same few seconds can take its place.
-    public static async Task OpenAtAsync(WindowSpot? spot, Action launch)
+    public static async Task<bool> OpenAtAsync(WindowSpot? spot, Action launch)
     {
-        if (spot == null) { launch(); return; }
         await Opening.WaitAsync();
         try
         {
@@ -41,9 +41,14 @@ public sealed record WindowSpot(int Left, int Top, int Right, int Bottom, bool M
             for (var i = 0; i < 40; i++) // up to 10 s
             {
                 await Task.Delay(250);
-                if (Terminals().FirstOrDefault(h => !before.Contains(h)) is var h && h != 0) { await spot.PlaceAsync(h); return; }
+                if (Terminals().FirstOrDefault(h => !before.Contains(h)) is var h && h != 0)
+                {
+                    if (spot != null) await spot.PlaceAsync(h);
+                    return true;
+                }
             }
-            Program.Log("reopened window not found: left where it opened");
+            Program.Log("opened window not found" + (spot != null ? ": left where it opened" : ""));
+            return false;
         }
         finally { Opening.Release(); }
     }

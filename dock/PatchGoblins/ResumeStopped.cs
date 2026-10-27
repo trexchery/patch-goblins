@@ -349,15 +349,16 @@ public static class ResumeStopped
         dir != DefaultDir && int.TryParse(Path.GetFileName(dir.TrimEnd('\\', '/')).Split('-')[0], out var n) ? n : null;
 
     /// Where the default login can move when `refused` ran out, best (most room) first. Usage read and below full; enabled;
-    /// not refused until a reset still ahead, whatever a reading older than the refusal says; and not run by a `cswap run`
-    /// window (`liveProfiles`): two live copies of one rotating login would strand one. The switch itself is `--exclusive`, so the engine refuses it too.
+    /// not refused until a reset still ahead, whatever a reading older than the refusal says. An account a `cswap run` window
+    /// holds (`liveProfiles`) is only tried after the others (two live copies of one rotating login can strand one), never
+    /// left out: a window at its limit moves to any account with room. The engine refuses it if the profile's login is ahead.
     /// Below the engine's `threshold` first (above it the engine would switch again at once); only if none, anything below full.
     public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
         IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
     {
         var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Peak(a) < Full
-                && !liveProfiles.Contains(a.Number) && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
-        return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => Peak(a)).Select(a => a.Number)];
+                && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
+        return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => liveProfiles.Contains(a.Number)).ThenBy(a => Peak(a)).Select(a => a.Number)];
     }
 
     /// When the first account frees up: the soonest reset ahead among the accounts refused and the windows read as full.
