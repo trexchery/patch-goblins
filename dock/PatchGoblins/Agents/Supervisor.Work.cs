@@ -457,8 +457,7 @@ public sealed partial class Supervisor
             item.Worktree = null;
         }
         if (item.Branch is { } b) await GitAsync(repo.Path, "branch", "-D", b);
-        try { Directory.Delete(_store.RunDir(repo, item), recursive: true); }
-        catch (IOException) { }
+        TryDeleteDirectory(_store.RunDir(repo, item));
         Save();
     }
 
@@ -615,13 +614,36 @@ public sealed partial class Supervisor
         catch (PolicyException e) { throw new AgentsException("the repository's policy is unreadable: " + e.Message); }
         var wt = _store.Worktree(repo, probe);
         await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
-        try { if (Directory.Exists(wt)) Directory.Delete(wt, recursive: true); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        if (Directory.Exists(wt)) TryDeleteDirectory(wt);
         await GitAsync(repo.Path, "worktree", "prune");
         var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
         return add.Ok ? wt : throw new AgentsException($"could not check out {start}: {add.Why}");
     }
 
-    Task RemoveProbeAsync(RepoAgents repo, WorkItem probe) => GitAsync(repo.Path, "worktree", "remove", "--force", _store.Worktree(repo, probe));
+    /// Tests only: runs first in every probe removal (a throw or a hang there stands for git failing or hanging). Null in production.
+    internal Func<WorkItem, Task>? BeforeProbeRemoval;
+
+    async Task RemoveProbeAsync(RepoAgents repo, WorkItem probe)
+    {
+        if (BeforeProbeRemoval is { } hook) await hook(probe);
+        await GitAsync(repo.Path, "worktree", "remove", "--force", _store.Worktree(repo, probe));
+    }
+
+    /// Cleanup inside a `finally`: waits for the probe checkout to go (Config.ProbeCleanup at most) but never throws, so the
+    /// bookkeeping after it (_goalBusy, _workers, _launching, Pump) always runs. A checkout left behind is replaced by the
+    /// next ProbeWorktreeAsync, whose own git call queues behind this one on _gitGate.
+    async Task TryRemoveProbeAsync(RepoAgents repo, WorkItem probe)
+    {
+        var removal = Fire(() => RemoveProbeAsync(repo, probe)); // logs a failure instead of throwing
+        if (await Task.WhenAny(removal, Task.Delay(Config.ProbeCleanup)) != removal) Program.Log($"removing the {probe.Id} checkout of {repo.Leaf} did not finish in {Config.ProbeCleanup.TotalSeconds:0} s; the next plan replaces it");
+    }
+
+    /// A folder an antivirus scan, an indexer or a read-only file still holds is left for the next run to replace.
+    internal static void TryDeleteDirectory(string dir)
+    {
+        try { Directory.Delete(dir, recursive: true); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
 
     /// Before the first run of a newly started repository: the gate must pass on the base branch, or
     /// every item would fail it for reasons that are not its own.
@@ -653,8 +675,8 @@ public sealed partial class Supervisor
         }
         finally
         {
-            await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
-            try { Directory.Delete(_store.RunDir(repo, probe), recursive: true); } catch (IOException) { }
+            await TryRemoveProbeAsync(repo, probe);
+            TryDeleteDirectory(_store.RunDir(repo, probe));
             _baseline.Remove(repo);
             if (again) _rebaseline.Add(repo);
             Save();

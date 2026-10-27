@@ -47,6 +47,8 @@ public sealed class AgentsConfig
     public bool Ultracode { get; set; }
     /// The Director orders and routes queued work no goal planned (Supervisor.WantsTriage). Off: it runs on default routes.
     public bool Triage { get; set; } = true;
+    /// The most a finished run's cleanup waits for its probe checkout to go (Supervisor.TryRemoveProbeAsync); a hung git must not hold the goal busy.
+    public TimeSpan ProbeCleanup { get; set; } = TimeSpan.FromSeconds(30);
 }
 
 /// `Transient`: nothing is wrong with the work itself (a fetch that failed, as when offline), so it is no failure to count.

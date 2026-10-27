@@ -167,7 +167,7 @@ public sealed partial class Supervisor
         {
             if (!launched)
             {
-                if (wt != null && !_disposed) await RemoveProbeAsync(repo, probe); // before the goal is free: the next launch reuses the path
+                if (wt != null && !_disposed) await TryRemoveProbeAsync(repo, probe); // before the goal is free: the next launch reuses the path
                 _goalBusy.Remove(goal);
             }
             _launching = false;
@@ -222,7 +222,7 @@ public sealed partial class Supervisor
         }
         finally
         {
-            if (!_disposed) await RemoveProbeAsync(repo, probe); // before the goal is free: a new launch must not share this checkout
+            if (!_disposed) await TryRemoveProbeAsync(repo, probe); // before the goal is free: a new launch must not share this checkout
             _workers.Remove(goal);
             _goalBusy.Remove(goal);
             w.Proc.Dispose();
@@ -620,8 +620,8 @@ public sealed partial class Supervisor
         {
             if (probed && !_disposed)
             {
-                await RemoveProbeAsync(repo, probe);
-                try { Directory.Delete(_store.RunDir(repo, probe), recursive: true); } catch (IOException) { }
+                await TryRemoveProbeAsync(repo, probe);
+                TryDeleteDirectory(_store.RunDir(repo, probe));
             }
             _goalBusy.Remove(goal);
             if (!_disposed) Save();

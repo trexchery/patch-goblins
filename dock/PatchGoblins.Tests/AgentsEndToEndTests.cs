@@ -997,6 +997,84 @@ public sealed class AgentsEndToEndTests : IDisposable
         _sup!.Dispose();
     }
 
+    /// Cleanup that fails (git throws or hangs while removing the planner's or the check's checkout; an antivirus-style hold on a
+    /// file in the check's run folder) must never leave the goal busy: the plan is still judged, the claim still checked, the next plan still launched.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFailingCleanupOfAProbeCheckoutDoesNotStrandTheGoal(bool hang)
+    {
+        var ready = P("ready");
+        var check = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (exit 1)" : $"test -f '{ready}'";
+        Plan("""{"status":"achieved","summary":"already there","evidence":"it already works"}""");
+        Plan("""{"status":"achieved","summary":"ready now","evidence":"ready is in place"}""");
+        var config = GoalConfig(TimeSpan.FromSeconds(8));
+        config.ProbeCleanup = TimeSpan.FromSeconds(1);
+        string? held = null;
+        var removals = 0;
+        await StartAsync(config);
+        await _loop.Run(() =>
+        {
+            _sup!.BeforeProbeRemoval = probe =>
+            {
+                removals++;
+                if (hang) return new TaskCompletionSource().Task; // git hangs
+                if (probe.Id.StartsWith("goal-") && held == null)
+                {
+                    // A read-only file in the check's run folder: deleting the folder throws UnauthorizedAccessException.
+                    var dir = Path.Combine(_store.RunDir(_sup.RepoFor(_repo)!, probe), "held");
+                    Directory.CreateDirectory(dir);
+                    File.WriteAllText(Path.Combine(dir, "x"), "");
+                    if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.ReadOnly);
+                    else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                    held = dir;
+                }
+                throw new InvalidOperationException("git could not start");
+            };
+            return 0;
+        });
+        try
+        {
+            await Tool("agents_control", """{"action":"start"}""");
+            await Goal(new { action = "set", title = "Be ready", checks = new[] { check } });
+
+            await Until(r => G(r).Refuted?.Contains("failed on main") == true, "the check ran although the planner's cleanup failed", seconds: 45);
+            File.WriteAllText(ready, "");
+            await Until(r => G(r).State == GoalState.Achieved, "the next plan launched and its claim passed although cleanups failed", seconds: 45);
+            Assert.True(removals >= 4, $"{removals} probe removals: two plans and two checks");
+        }
+        finally
+        {
+            _sup!.Dispose();
+            if (held != null)
+            {
+                if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(held, "x"), FileAttributes.Normal);
+                else File.SetUnixFileMode(held, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
+
+    [Fact]
+    public void ADirectoryAnotherProgramHoldsIsLeftBehindWithoutThrowing()
+    {
+        var dir = P("held");
+        var file = Path.Combine(dir, "x");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(file, "");
+        if (OperatingSystem.IsWindows()) File.SetAttributes(file, FileAttributes.ReadOnly);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            Supervisor.TryDeleteDirectory(dir);
+            Assert.True(File.Exists(file)); // not deleted, and no exception: UnauthorizedAccessException is as transient as IOException
+        }
+        finally
+        {
+            if (OperatingSystem.IsWindows()) File.SetAttributes(file, FileAttributes.Normal);
+            else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
     [Fact]
     public async Task AClaimWaitsForItsOpenWorkAndMergedWorkProvesIt()
     {
