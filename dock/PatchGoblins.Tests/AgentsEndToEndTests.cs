@@ -1054,6 +1054,87 @@ public sealed class AgentsEndToEndTests : IDisposable
         }
     }
 
+    /// Read-only file in a probe's run folder: deleting the folder throws UnauthorizedAccessException.
+    static string Hold(string runDir)
+    {
+        var dir = Path.Combine(runDir, "held");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "x"), "");
+        if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.ReadOnly);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        return dir;
+    }
+
+    static void Release(string dir)
+    {
+        if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.Normal);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
+    /// The baseline check's cleanup (its checkout, its run folder) that fails must not leave the repository "baselining" for good: the work still dispatches.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFailingCleanupOfTheBaselineCheckoutStillLetsTheRepositoryDispatch(bool hang)
+    {
+        Issues("""[{"number":64,"title":"Small","body":"Polish.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var config = Fast();
+        config.ProbeCleanup = TimeSpan.FromSeconds(1);
+        string? held = null;
+        var removals = 0;
+        await StartAsync(config);
+        await _loop.Run(() =>
+        {
+            _sup!.BeforeProbeRemoval = probe =>
+            {
+                if (probe.Id != "baseline") return Task.CompletedTask;
+                removals++;
+                if (hang) return new TaskCompletionSource().Task; // git hangs
+                held ??= Hold(_store.RunDir(_sup.RepoFor(_repo)!, probe)); // and the run folder cannot be deleted either
+                throw new InvalidOperationException("git could not start");
+            };
+            return 0;
+        });
+        try
+        {
+            await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+            await Until(r => Item(r, 64).State == ItemState.Open, "the repository dispatches although the baseline's cleanup failed", seconds: 45);
+            Assert.True(removals >= 1);
+        }
+        finally
+        {
+            _sup!.Dispose();
+            if (held != null) Release(held);
+        }
+    }
+
+    /// FinishAsync's run-folder delete that hits a read-only file must not throw: the skip still completes, the item goes, work moves on.
+    [Fact]
+    public async Task AHeldRunFolderDoesNotStopAnItemFromFinishing()
+    {
+        Issues("""
+            [{"number":70,"title":"Skip me","body":"[fake:long]","labels":[],"assignees":[],"author":{"login":"owner"}},
+             {"number":71,"title":"Next","body":"[fake:long]","labels":[],"assignees":[],"author":{"login":"owner"}}]
+            """);
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 70).Run is { Pid: > 0 } && Runs.Length == 1, "the first run starts");
+        var pid = await On(r => Item(r, 70).Run!.Pid);
+        var held = Hold(await _loop.Run(() => _store.RunDir(_sup!.RepoFor(_repo)!, Item(_sup.RepoFor(_repo)!, 70))));
+        try
+        {
+            Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#70"}"""));
+            await Until(r => r.Items.All(i => i.Issue != 70) && Item(r, 71).Run is { Pid: > 0 } && Runs.Length == 2, "work moves on to the next issue");
+            await Gone(pid);
+            Assert.True(Directory.Exists(held)); // left for the next run to replace, not deleted and not thrown
+        }
+        finally
+        {
+            _sup!.Dispose();
+            Release(held);
+        }
+    }
+
     [Fact]
     public void ADirectoryAnotherProgramHoldsIsLeftBehindWithoutThrowing()
     {
