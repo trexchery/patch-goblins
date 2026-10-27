@@ -240,3 +240,126 @@ async def test_work_dashboard_runs_tools_and_releases_repository_lease(monkeypat
         assert any("agents-mcp" in call for call in calls)
         assert any("agents_control" in call and '{"action": "pause"}' in call for call in calls)
     assert lease.stdin.closed
+
+
+@pytest.mark.parametrize("provider,home_variable", [("codex", "CODEX_HOME"), ("grok", "GROK_HOME")])
+def test_provider_official_login_is_isolated_and_temp_credentials_are_removed(monkeypatch, provider, home_variable):
+    monkeypatch.setenv("GROK_AUTH", "SYNTHETIC-inline")
+    monkeypatch.setenv("GROK_AUTH_PATH", "/do-not-read/auth.json")
+    monkeypatch.setenv("OPENAI_API_KEY", "SYNTHETIC-inline")
+    captured = {}
+    def login(argv, **kwargs):
+        assert argv == ["/fake/" + provider, "login"]
+        captured.update(kwargs["env"])
+        for secret in ("GROK_AUTH", "GROK_AUTH_PATH", "OPENAI_API_KEY"):
+            assert secret not in kwargs["env"]
+        if provider == "codex":
+            assert 'cli_auth_credentials_store = "file"' in (Path(kwargs["env"][home_variable]) / "config.toml").read_text()
+        return subprocess.CompletedProcess(argv, 0)
+    with patch("claude_swap.goblins.shutil.which", return_value="/fake/" + provider), \
+         patch("claude_swap.goblins.subprocess.run", side_effect=login), \
+         patch("claude_swap.providers." + provider + "._roster", return_value=[]), \
+         patch("claude_swap.providers." + provider + ".cmd_add_current") as preserve, \
+         patch("claude_swap.providers." + provider + ".cmd_enroll", return_value={"added": {"email": "synthetic@example.com"}}) as enroll:
+        assert goblins.add_provider(provider) == "synthetic@example.com"
+    preserve.assert_called_once()
+    assert enroll.call_args.args[0] == captured[home_variable]
+    assert not Path(captured[home_variable]).exists()
+
+
+def test_provider_login_failure_does_not_enroll_or_rewrite_roster():
+    with patch("claude_swap.goblins.shutil.which", return_value="/fake/codex"), \
+         patch("claude_swap.goblins.subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+         patch("claude_swap.providers.codex.cmd_enroll") as enroll:
+        with pytest.raises(ClaudeSwitchError, match="did not finish"):
+            goblins.add_provider("codex")
+    enroll.assert_not_called()
+
+
+def test_nonactive_provider_terminal_reuses_existing_sealed_profile_runner():
+    with patch("claude_swap.providers.codex.cmd_run", return_value={"exitCode": 7}) as run, \
+         patch("claude_swap.providers.codex.cmd_switch") as switch:
+        assert goblins.provider_terminal("codex", 2) == 7
+    run.assert_called_once_with(2)
+    switch.assert_not_called()
+
+
+def test_provider_labels_reuse_current_quota_formatter_and_mark_stale_data():
+    label = goblins.provider_account_label({"number": 2, "email": "synthetic@example.com", "usage": None,
+        "lastGoodUsage": {"fiveHour": {"pct": 25}, "sevenDay": {"pct": 55}}})
+    assert "5h 25%" in label and "7d 55%" in label
+    assert label.endswith(" (stale)")
+
+
+def test_native_mapping_actions_reuse_mapping_store_without_switching_credentials(monkeypatch, tmp_path):
+    from claude_swap.mappings import MappingStore
+    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace())
+    client = MagicMock()
+    with patch("claude_swap.goblins.BackendClient", return_value=client):
+        extension = goblins.MenuExtension()
+    folder = tmp_path / "repo with spaces"
+    folder.mkdir()
+    extension._choose_repo = lambda: str(folder)
+    extension._refresh = MagicMock()
+    switcher = types.SimpleNamespace(backup_dir=tmp_path / "store", resolve_account=MagicMock(return_value=("2", "synthetic@example.com", "org-1")))
+    app = types.SimpleNamespace(switcher=switcher, refresh_async=MagicMock())
+    extension._map(app, 2)
+    assert MappingStore(switcher.backup_dir).get(folder)["email"] == "synthetic@example.com"
+    extension._map(app, None)
+    assert MappingStore(switcher.backup_dir).get(folder) is None
+    client.request.assert_not_called()
+
+
+def test_handoff_only_copies_backend_prompt_for_grok(monkeypatch, tmp_path):
+    client = MagicMock()
+    client.request.return_value = {"prompt": "Read the hand-off notes in /tmp/synthetic.md and continue."}
+    client.events = queue.Queue()
+    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace())
+    with patch("claude_swap.goblins.BackendClient", return_value=client):
+        extension = goblins.MenuExtension()
+    extension._background = lambda fn: fn()
+    extension._choose_repo = lambda: str(tmp_path)
+    extension._handoff("claude", "grok")
+    client.request.assert_called_once_with("handoff", {"source": "claude", "target": "grok", "folder": str(tmp_path)}, timeout=180)
+    assert client.events.get_nowait() == {"event": "ui_copy", "text": client.request.return_value["prompt"]}
+
+
+def test_account_terminal_honors_folder_mapping_and_remote_control_setting(monkeypatch, tmp_path):
+    from claude_swap.mappings import MappingStore
+    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace())
+    with patch("claude_swap.goblins.BackendClient"):
+        extension = goblins.MenuExtension()
+    extension.switcher = types.SimpleNamespace(backup_dir=tmp_path / "store")
+    extension._choose_repo = lambda: str(tmp_path)
+    extension.snapshot = {"config": {"autoProjectAccount": True, "preserveRemoteControl": False}}
+    MappingStore(extension.switcher.backup_dir).set(tmp_path, "synthetic@example.com", "")
+    with patch("claude_swap.goblins.run_terminal") as opened:
+        extension._claude_terminal(2)
+    argv = opened.call_args.args[0]
+    assert argv[-2:] == ["--engine", "run"]
+    assert "--restore-rc" not in argv
+    extension.snapshot = {"config": {"autoProjectAccount": False, "preserveRemoteControl": True}}
+    with patch("claude_swap.goblins.run_terminal") as opened:
+        extension._claude_terminal(2)
+    assert opened.call_args.args[0][-4:] == ["--engine", "run", "2", "--restore-rc"]
+
+
+def test_provider_menu_callbacks_keep_provider_and_account_identity(monkeypatch):
+    class Item:
+        def __init__(self, title, callback=None):
+            self.title, self.callback, self.children, self.state = title, callback, [], 0
+        def add(self, item):
+            self.children.append(item)
+    with patch("claude_swap.goblins.BackendClient"):
+        extension = goblins.MenuExtension()
+    extension.snapshot = {"providers": {"codex": {"accounts": [{"number": 2, "email": "synthetic@example.com", "active": True}]},
+                                        "grok": {"accounts": [{"number": 7, "email": "other@example.com", "active": False}]}}}
+    menus = extension._provider_menus(types.SimpleNamespace(MenuItem=Item))
+    extension._provider_open = MagicMock()
+    extension._provider_switch = MagicMock()
+    menus[0].children[0].children[0].callback(None)
+    menus[1].children[0].children[0].callback(None)
+    menus[1].children[0].children[1].callback(None)
+    assert extension._provider_open.call_args_list[0].args == ("codex", None)
+    assert extension._provider_open.call_args_list[1].args == ("grok", 7)
+    extension._provider_switch.assert_called_once_with("grok", 7)

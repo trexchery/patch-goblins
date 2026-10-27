@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -77,7 +78,10 @@ def test_seal_store_roundtrip(env):
     grok._seal(7, grok.DEFAULT_SCOPE, rec)
     raw = grok._cred_path(7).read_text(encoding="utf-8")
     assert SECRET not in raw
-    assert json.loads(dpapi.unseal(raw)) == {"scope": grok.DEFAULT_SCOPE, "record": rec}
+    if sys.platform != "darwin":
+        assert json.loads(dpapi.unseal(raw)) == {"scope": grok.DEFAULT_SCOPE, "record": rec}
+    else:
+        assert raw.startswith("keychain-provider-v1:")
     assert grok._unseal(7) == (grok.DEFAULT_SCOPE, rec)
 
 

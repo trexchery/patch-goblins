@@ -91,7 +91,7 @@ internal sealed partial class BackendUpkeep : IDisposable
                 autoCancel = new CancellationTokenSource();
                 autoTask = AutoAsync(autoCancel.Token); // buffering never blocks the API-error watcher
             }
-            if (settings.AutoPrime)
+            if (settings.AutoPrime && !priming)
             {
                 if (primer.Observe(snap.Accounts, now)) primer.Save();
                 if (primer.WantsReread(now)) { await engine.ListAsync(refresh: true); await refresh(); primer.Reread(now); }
@@ -101,17 +101,7 @@ internal sealed partial class BackendUpkeep : IDisposable
                     && primer.Ready(snap.Accounts, now) is { Count: > 0 } ready)
                 {
                     lastPrime = now;
-                    var fresh = await engine.ListAsync(refresh: true);
-                    if (primer.Observe(fresh.Accounts, DateTimeOffset.Now)) primer.Save();
-                    foreach (var account in primer.Ready(fresh.Accounts, DateTimeOffset.Now, Primer.SendReadingAge)
-                                 .Where(a => ready.Any(b => Primer.Same(a, b))))
-                    {
-                        if (disposed || !settings.AutoPrime || !supervisor.IsRunning || !primer.Begin(account, DateTimeOffset.Now)) break;
-                        var (result, detail) = await engine.PrimeAsync(account);
-                        primer.Finish(account, result, detail);
-                        if (result != PrimeResult.Sent) notify("Auto-Prime", $"#{account.Number}: {detail}");
-                    }
-                    await refresh();
+                    await PrimeCandidatesAsync(ready, () => settings.AutoPrime && supervisor.IsRunning);
                 }
             }
             if (!settings.AutoSwitch || threshold == null || disposed) return;

@@ -30,6 +30,8 @@ Launch **Patch Goblins** from Applications. The menu bar retains the existing ac
 
 Open an agents terminal for a repository to connect a regular Claude Code session to Patch Goblins' existing MCP tools. Starting agents for a repository displays a native approval showing the repository, base branch, and verification commands. The same approval boundary applies when new goal checks would run unattended.
 
+The work menu also exposes manual Prime, the general agent, account aliases and folder assignments, agent settings, and continuing interrupted work between providers. Codex and Grok have their own quota/account submenus, isolated official login flows, account switches, removal and terminals. These controls call the existing provider and handoff engines.
+
 Agents work only while a repository's agents terminal is connected. Closing its final terminal pauses its work. Reopening it reconnects to the running Supervisor. The dashboard also exposes pause/resume, goals, requests, details, and questions waiting for the owner. A protected push remains held until the owner explicitly answers its approval.
 
 The standalone backend also provides commands for diagnostics and terminal integration:
@@ -56,6 +58,7 @@ The terminal keeps the goblin theme, session commands, status line, and mascot p
 ## Security boundaries
 
 - Account credentials stay in the existing local account engine and macOS Keychain integration. The UI/backend protocol carries account status and orchestration requests, not credential exports.
+- Dormant Codex/Grok credentials use verified macOS Keychain entries. Their files hold only references. Legacy base64 files migrate only after a verified Keychain write; unavailable Keychain access fails closed. Large payloads are split into bounded entries so the existing `security` wrapper keeps secret data on stdin. Windows retains DPAPI sealing.
 - The backend uses a single-thread synchronization context, a private instance lock, and the existing per-user named-pipe transport.
 - Workers inherit the existing environment restrictions: no usable GitHub token, an empty GitHub configuration, disabled Git credential helpers, blocked network Git protocols, and denied push/GitHub tools. The Supervisor performs authorized GitHub operations after verification and review.
 - The base branch's policy applies to a change; a worker cannot relax it by editing its worktree copy. Sensitive files, changed policy checks, pinned bases, and held pushes retain the shared gates.

@@ -38,6 +38,7 @@ from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.json_output import SCHEMA_VERSION, error_envelope, usage_to_json
 from claude_swap.paths import get_backup_root
 from claude_swap.process_detection import is_pid_alive
+from claude_swap.providers import _credentials
 
 ISSUER = "https://auth.x.ai"
 DEFAULT_SCOPE = f"{ISSUER}::b1a00492-073a-47ea-816f-4c329264a828"
@@ -142,12 +143,12 @@ def _cred_path(n: int) -> Path:
 
 
 def _seal(n: int, scope: str, record: dict) -> None:
-    _atomic_write(_cred_path(n), dpapi.seal(json.dumps({"scope": scope, "record": record})))
+    _credentials.write(_cred_path(n), json.dumps({"scope": scope, "record": record}), _atomic_write)
 
 
 def _unseal(n: int) -> tuple[str, dict]:
     try:
-        data = json.loads(dpapi.unseal(read_text_with_retry(_cred_path(n))))
+        data = json.loads(_credentials.read(_cred_path(n), _atomic_write))
     except FileNotFoundError:
         raise GrokError(f"account {n} has no stored credentials") from None
     return data["scope"], data["record"]
@@ -426,8 +427,11 @@ def cmd_switch(n: int) -> dict:
 
 def cmd_remove(n: int) -> dict:
     acc = _find(n)
+    if sys.platform == "darwin":
+        _credentials.delete(_cred_path(n))
     _save_roster([a for a in _roster() if a["number"] != n])
-    _cred_path(n).unlink(missing_ok=True)
+    if sys.platform != "darwin":
+        _cred_path(n).unlink(missing_ok=True)
     return {"schemaVersion": SCHEMA_VERSION, "removed": {"number": n, "email": acc["email"]}}
 
 

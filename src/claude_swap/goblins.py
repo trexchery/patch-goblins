@@ -211,6 +211,72 @@ def add_account() -> str:
                 delete_macos_keychain_entry(profile)
 
 
+def add_provider(provider: str) -> str:
+    """Reuse the Windows tray's official temporary-home login and provider engine."""
+    import importlib
+    import tempfile
+    if provider not in ("codex", "grok"):
+        raise ClaudeSwitchError("Choose Codex or Grok.")
+    env = child_environment()
+    binary = shutil.which(provider, path=env["PATH"])
+    if not binary:
+        raise ClaudeSwitchError(f"Install the official {provider} CLI first.")
+    with tempfile.TemporaryDirectory(prefix=f"patch-goblins-{provider}-login-") as temporary:
+        env["CODEX_HOME" if provider == "codex" else "GROK_HOME"] = temporary
+        for name in ("GROK_AUTH", "GROK_AUTH_PATH", "OPENAI_API_KEY", "CODEX_API_KEY", "XAI_API_KEY"):
+            env.pop(name, None)
+        if provider == "codex":
+            (Path(temporary) / "config.toml").write_text('cli_auth_credentials_store = "file"\n', encoding="utf-8")
+        if subprocess.run([binary, "login"], env=env, check=False).returncode != 0:
+            raise ClaudeSwitchError(f"{provider} login did not finish. No account was added.")
+        module = importlib.import_module("claude_swap.providers." + provider)
+        provider_error = module.CodexError if provider == "codex" else module.GrokError
+        # Preserve the existing default login on first enrollment, as Windows
+        # does. These reads never refresh or rotate its single-use token.
+        if not module._roster():
+            try:
+                module.cmd_add_current()
+            except provider_error:
+                pass  # a machine with no prior login simply enrolls the new one
+        try:
+            return module.cmd_enroll(temporary)["added"]["email"]
+        except (provider_error, OSError, ValueError) as exc:
+            raise ClaudeSwitchError(str(exc)) from None
+
+
+def provider_terminal(provider: str, account: int | None) -> int:
+    if provider not in ("codex", "grok"):
+        raise ClaudeSwitchError("Choose Codex or Grok.")
+    if account is not None:
+        import importlib
+        module = importlib.import_module("claude_swap.providers." + provider)
+        provider_error = module.CodexError if provider == "codex" else module.GrokError
+        try:
+            result = module.cmd_run(account)
+        except (provider_error, OSError, ValueError) as exc:
+            raise ClaudeSwitchError(str(exc)) from None
+        return int(result.get("exitCode", 0))
+    env = child_environment()
+    binary = shutil.which(provider, path=env["PATH"])
+    if not binary:
+        raise ClaudeSwitchError(f"Install the official {provider} CLI first.")
+    return subprocess.run([binary], env=env, check=False).returncode
+
+
+def provider_account_label(account: dict) -> str:
+    from claude_swap.menubar import format_account_label
+    def window(value):
+        return {**value, "resets_at": value.get("resetsAt", value.get("resets_at"))} if isinstance(value, dict) else value
+    usage = account.get("usage") or account.get("lastGoodUsage")
+    if isinstance(usage, dict):
+        usage = {"five_hour": window(usage.get("fiveHour")), "seven_day": window(usage.get("sevenDay")),
+                 "scoped": [window(value) for value in usage.get("scoped") or []]}
+    else:
+        usage = account.get("usageNote") or account.get("usageStatus") or "usage unavailable"
+    text = format_account_label(account.get("number"), account.get("email", ""), usage, alias=account.get("alias"))
+    return text + (" (stale)" if account.get("usage") is None and account.get("lastGoodUsage") else "")
+
+
 class MenuExtension:
     hosts_auto_switch = True
 
@@ -227,6 +293,7 @@ class MenuExtension:
         self._smoke_deadline = time.monotonic() + 20
 
     def start(self, app):
+        self.switcher = app.switcher
         self.client.start()
         self._refresh()
 
@@ -276,6 +343,12 @@ class MenuExtension:
                     self._finish_smoke(app, False)
                     return
                 rumps.alert(title="Patch Goblins", message=message["message"])
+            elif event == "ui_copy":
+                import AppKit
+                board = AppKit.NSPasteboard.generalPasteboard()
+                board.clearContents()
+                board.setString_forType_(message["text"], AppKit.NSPasteboardTypeString)
+                rumps.notification("Patch Goblins", "Hand-off ready", "Paste the copied prompt into Grok to continue with the notes.")
             elif event == "stopped":
                 self._stopped = True
                 self._restart_at = time.monotonic() + 3
@@ -329,6 +402,9 @@ class MenuExtension:
         panel.setCanChooseDirectories_(True)
         panel.setAllowsMultipleSelection_(False)
         panel.setMessage_("Choose the root of a Git repository")
+        initial = self.snapshot.get("config", {}).get("terminalFolder")
+        if initial and Path(initial).is_dir():
+            panel.setDirectoryURL_(AppKit.NSURL.fileURLWithPath_(initial))
         return panel.URL().path() if panel.runModal() == AppKit.NSModalResponseOK else None
 
     def menu(self, app, rumps):
@@ -339,6 +415,20 @@ class MenuExtension:
         work.add(rumps.MenuItem("Open work dashboard…", callback=lambda _: self.open_dashboard()))
         work.add(rumps.MenuItem("Open account dashboard", callback=lambda _: self._guard(lambda: run_terminal(app_command("--accounts")))))
         work.add(rumps.MenuItem("Sign in another account…", callback=lambda _: self._guard(lambda: run_terminal(app_command("--add-account")))))
+        work.add(rumps.MenuItem("New general agent", callback=lambda _: self._background(lambda: self.client.request("new_agent"))))
+        work.add(rumps.MenuItem("Prime fresh 5-hour windows", callback=lambda _: self._background(self._prime)))
+        prime_status = rumps.MenuItem("Auto-Prime status")
+        for line in self.snapshot.get("primeStatus", []) or ["No fresh 5-hour windows right now"]:
+            prime_status.add(rumps.MenuItem(str(line)))
+        work.add(prime_status)
+        work.add(self._account_tools(app, rumps))
+        work.add(self._desktop_settings(rumps))
+        handoffs = rumps.MenuItem("Continue interrupted work")
+        for source in ("claude", "codex"):
+            for target in ("claude", "codex", "grok"):
+                if source != target:
+                    handoffs.add(rumps.MenuItem(f"{source.title()} → {target.title()}…", callback=lambda _, s=source, t=target: self._handoff(s, t)))
+        work.add(handoffs)
         repos = self.snapshot.get("repos", self.snapshot.get("Repos", []))
         for repo in repos if isinstance(repos, list) else []:
             path = repo.get("path", repo.get("Path", ""))
@@ -352,7 +442,169 @@ class MenuExtension:
         from claude_swap.launch_agent import plist_path
         login.state = int(plist_path("com.patch-goblins.menubar").exists())
         work.add(login)
-        return [work, None]
+        return [work, *self._provider_menus(rumps), None]
+
+    def _provider_menus(self, rumps):
+        providers = self.snapshot.get("providers", {})
+        menus = []
+        for provider in ("codex", "grok"):
+            section = rumps.MenuItem(provider.title())
+            data = providers.get(provider, {}) if isinstance(providers, dict) else {}
+            for account in data.get("accounts", []) if isinstance(data, dict) else []:
+                number, active = account["number"], account.get("active", False)
+                item = rumps.MenuItem(provider_account_label(account))
+                item.state = int(active)
+                item.add(rumps.MenuItem("Open terminal…", callback=lambda _, p=provider, n=number, a=active: self._provider_open(p, None if a else n)))
+                item.add(rumps.MenuItem("Switch account", callback=lambda _, p=provider, n=number: self._provider_switch(p, n)))
+                item.add(rumps.MenuItem("Remove account", callback=lambda _, p=provider, n=number: self._provider_remove(p, n)))
+                section.add(item)
+            if not isinstance(data, dict) or not data.get("accounts"):
+                section.add(rumps.MenuItem("No managed accounts"))
+            section.add(rumps.MenuItem("Sign in another account…", callback=lambda _, p=provider: self._guard(lambda: run_terminal(app_command("--add-provider", p)))))
+            section.add(rumps.MenuItem("Open current login…", callback=lambda _, p=provider: self._provider_open(p, None)))
+            menus.append(section)
+        return menus
+
+    def _provider_open(self, provider, number):
+        def opened():
+            folder = self._choose_repo()
+            if folder:
+                args = ["--provider-terminal", provider]
+                if number is not None:
+                    args += ["--account", str(number)]
+                run_terminal(app_command(*args), repo=folder)
+        self._guard(opened)
+
+    def _provider_switch(self, provider, number):
+        def switched():
+            self.client.request("provider_switch", {"provider": provider, "number": number})
+            self.client.events.put({"event": "notify", "title": f"{provider.title()} account selected", "body": "New sessions use this account. Existing sessions keep their account until restarted."})
+            self._refresh()
+        self._background(switched)
+
+    def _provider_remove(self, provider, number):
+        import rumps
+        if rumps.alert(title="Remove account", message=f"Remove {provider.title()} account {number} from Patch Goblins?", ok="Remove", cancel="Cancel") == 1:
+            def removed():
+                self.client.request("provider_command", {"provider": provider, "args": ["remove", str(number)]})
+                self._refresh()
+            self._background(removed)
+
+    def _desktop_settings(self, rumps):
+        config = self.snapshot.get("config", {})
+        menu = rumps.MenuItem("Agent settings")
+        for key, title in (("autoPrime", "Auto-Prime"), ("autoLine", "Adaptive switch threshold"),
+                           ("quotaNotifications", "Quota notifications"), ("agentDraftPrs", "Draft pull requests"),
+                           ("agentUltracode", "Allow ultracode"), ("askApproval", "Ask for approvals"),
+                           ("preserveRemoteControl", "Restore Remote Control"), ("autoProjectAccount", "Prefer folder account")):
+            value = bool(config.get(key, key in ("autoLine", "askApproval", "preserveRemoteControl")))
+            item = rumps.MenuItem(title, callback=lambda _, k=key, v=value: self._background(lambda: self._save_setting(k, not v)))
+            item.state = int(value)
+            menu.add(item)
+        for key, title in (("agentIssues", "Issues at once"), ("agentOpenPrs", "Open pull request limit")):
+            menu.add(rumps.MenuItem(title + "…", callback=lambda _, k=key, t=title: self._set_number(k, t)))
+        menu.add(rumps.MenuItem("Choose terminal start folder…", callback=lambda _: self._set_terminal_folder()))
+        return menu
+
+    def _prime(self):
+        status = self.client.request("prime", timeout=300)
+        self.client.events.put({"event": "notify", "title": "Auto-Prime", "body": "\n".join(status) if isinstance(status, list) and status else "No fresh 5-hour windows right now."})
+        self._refresh()
+
+    def _set_terminal_folder(self):
+        def selected():
+            folder = self._choose_repo()
+            if folder:
+                self._background(lambda: self._save_setting("terminalFolder", folder))
+        self._guard(selected)
+
+    def _set_number(self, key, title):
+        response = self._input(title, "Enter a whole number (0 issues means automatic).")
+        if response.clicked == 1:
+            def saved():
+                self.client.request("settings", {"values": {key: int(response.text.strip())}})
+                self._refresh()
+            self._background(saved)
+
+    def _save_setting(self, key, value):
+        self.client.request("settings", {"values": {key: value}})
+        self._refresh()
+
+    @staticmethod
+    def _input(title, message):
+        import AppKit
+        import rumps
+        AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        return rumps.Window(title=title, message=message, ok="Save", cancel="Cancel", dimensions=(320, 24)).run()
+
+    def _account_tools(self, app, rumps):
+        menu = rumps.MenuItem("Account tools")
+        for number, email, _active, _display, _usage, alias, _disabled, _at in app.snapshot["accounts"]:
+            account = rumps.MenuItem(f"{number} · {alias or email}")
+            account.add(rumps.MenuItem("Open terminal…", callback=lambda _, n=number: self._claude_terminal(n)))
+            account.add(rumps.MenuItem("Set alias…", callback=lambda _, n=number: self._alias(app, n)))
+            account.add(rumps.MenuItem("Assign folder…", callback=lambda _, n=number: self._map(app, n)))
+            menu.add(account)
+        menu.add(rumps.MenuItem("Remove folder mapping…", callback=lambda _: self._map(app, None)))
+        menu.add(rumps.MenuItem("View folder mappings", callback=lambda _: self._guard(lambda: run_terminal(app_command("--engine", "map")))))
+        return menu
+
+    def _claude_terminal(self, number):
+        def opened():
+            folder = self._choose_repo()
+            if folder:
+                config = self.snapshot.get("config", {})
+                args = ["--engine", "run"]
+                mapped = False
+                if config.get("autoProjectAccount") and hasattr(self, "switcher"):
+                    from claude_swap.mappings import MappingStore
+                    mapped = MappingStore(self.switcher.backup_dir).resolve(folder) is not None
+                if not mapped:
+                    args.append(str(number))
+                if config.get("preserveRemoteControl", True):
+                    args.append("--restore-rc")
+                run_terminal(app_command(*args), repo=folder)
+        self._guard(opened)
+
+    def _alias(self, app, number):
+        response = self._input("Account alias", "Letters, digits, dot, dash or underscore. Leave blank to remove.")
+        if response.clicked == 1:
+            def saved():
+                if response.text.strip():
+                    app.switcher.set_alias(str(number), response.text.strip())
+                else:
+                    app.switcher.unset_alias(str(number))
+                app.refresh_async()
+            self._guard(saved)
+
+    def _map(self, app, number):
+        def mapped():
+            folder = self._choose_repo()
+            if not folder:
+                return
+            from claude_swap.mappings import MappingStore
+            store = MappingStore(app.switcher.backup_dir)
+            if number is None:
+                store.remove(folder)
+            else:
+                _, email, org = app.switcher.resolve_account(str(number))
+                store.set(folder, email, org)
+            app.refresh_async()
+            self._refresh()
+        self._guard(mapped)
+
+    def _handoff(self, source, target):
+        def chosen():
+            folder = self._choose_repo()
+            if folder:
+                def continued():
+                    result = self.client.request("handoff", {"source": source, "target": target, "folder": folder}, timeout=180)
+                    if target == "grok":
+                        prompt = result.get("prompt", "") if isinstance(result, dict) else str(result or "")
+                        if prompt:
+                            self.client.events.put({"event": "ui_copy", "text": prompt})
+                self._background(continued)
+        self._guard(chosen)
 
     @staticmethod
     def _guard(fn):
@@ -416,10 +668,17 @@ def main(argv=None):
     parser.add_argument("--accounts", action="store_true", help="Open the existing account dashboard")
     parser.add_argument("--add-account", action="store_true", help="Sign in through the official Claude CLI in an isolated profile")
     parser.add_argument("--native-smoke", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--add-provider", choices=["codex", "grok"])
+    parser.add_argument("--provider-terminal", choices=["codex", "grok"])
+    parser.add_argument("--account", type=int)
     parser.add_argument("--repo", default=os.getcwd())
     options = parser.parse_args(args)
     try:
-        if options.add_account:
+        if options.add_provider:
+            print("Added account: " + add_provider(options.add_provider))
+        elif options.provider_terminal:
+            raise SystemExit(provider_terminal(options.provider_terminal, options.account))
+        elif options.add_account:
             print("Added account: " + add_account())
         elif options.tui:
             from claude_swap.goblins_ui import GoblinsApp

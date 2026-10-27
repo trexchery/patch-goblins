@@ -117,3 +117,16 @@ def test_second_supervisor_cannot_open_same_state_and_unknown_approval_is_reject
     assert duplicate.returncode != 0
     send(8, "approval", {"id": "invented-approval", "approved": True})
     assert receive(lambda value: value.get("id") == 8)["result"]["answered"] is False
+
+
+def test_provider_menu_rejects_credential_export_and_empty_prime_sends_nothing(host):
+    process, send, receive, env = host
+    send(10, "provider_command", {"provider": "codex", "args": ["export"]})
+    assert "menu can" in receive(lambda value: value.get("id") == 10)["error"]["message"]
+    send(11, "provider_switch", {"provider": "unknown", "number": 1})
+    assert "codex or grok" in receive(lambda value: value.get("id") == 11)["error"]["message"]
+    send(12, "prime")
+    assert receive(lambda value: value.get("id") == 12)["result"] == []
+    send(13, "settings", {"values": {"autoProjectAccount": True, "terminalFolder": None}})
+    result = receive(lambda value: value.get("id") == 13)["result"]
+    assert result["autoProjectAccount"] is True and result["terminalFolder"] is None

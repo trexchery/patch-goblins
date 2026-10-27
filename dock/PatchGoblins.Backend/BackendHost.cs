@@ -5,7 +5,7 @@ namespace PatchGoblins;
 
 /// JSON lines are private stdio between the native menu and the reused Supervisor.
 /// Approvals use separate request ids so the input reader never blocks awaiting a decision.
-internal sealed class BackendHost
+internal sealed partial class BackendHost
 {
     readonly Engine engine = Engine.Locate();
     readonly DockSettings settings = DockSettings.Load();
@@ -15,6 +15,7 @@ internal sealed class BackendHost
     Supervisor supervisor = null!;
     bool refreshing;
     Snapshot? accounts;
+    readonly Dictionary<string, Snapshot> providers = [];
     BackendUpkeep upkeep = null!;
 
     public async Task RunAsync()
@@ -30,7 +31,11 @@ internal sealed class BackendHost
             "They never merge, deploy or close issues. Work pauses when its agents terminal closes.");
         supervisor.ConfirmChecks = (repo, checks) => AskAsync($"Run goal checks in {repo.Leaf}?",
             $"These commands run as you in a fresh checkout of {repo.Base}:\n\n" + string.Join("\n", checks));
-        supervisor.Notify = (title, body) => Write(new { @event = "notify", title, body });
+        supervisor.Notify = (title, body) =>
+        {
+            if (settings.AskApproval || title is "Agents need you" or "Agents paused")
+                Write(new { @event = "notify", title, body });
+        };
         supervisor.Changed += () =>
         {
             foreach (var repo in supervisor.Repos)
@@ -93,6 +98,11 @@ internal sealed class BackendHost
                 "approval" => Answer(args),
                 "refresh" => await RefreshAsync(),
                 "settings" => SaveSettings(args),
+                "prime" => await upkeep.PrimeNowAsync(),
+                "provider_switch" => await ProviderSwitchAsync(args),
+                "provider_command" => await ProviderCommandAsync(args),
+                "new_agent" => NewAgent(),
+                "handoff" => await HandoffAsync(args),
                 "attach" => Attach(args, true),
                 "detach" => Attach(args, false),
                 "quit" => Quit(),
@@ -112,11 +122,15 @@ internal sealed class BackendHost
         "desktop_status" => JsonSerializer.Serialize(Status(), Json.Options),
         "desktop_settings" => JsonSerializer.Serialize(SaveSettings(args), Json.Options),
         "desktop_refresh" => JsonSerializer.Serialize(await RefreshAsync(), Json.Options),
+        "desktop_prime" => JsonSerializer.Serialize(await upkeep.PrimeNowAsync(), Json.Options),
+        "desktop_new_agent" => JsonSerializer.Serialize(NewAgent(), Json.Options),
+        "desktop_handoff" => JsonSerializer.Serialize(await HandoffAsync(args), Json.Options),
         _ => await supervisor.HandleAsync(tool, args, repo),
     };
 
     object Status() => new { schemaVersion = 1, repos = supervisor.Repos, config = settings,
-        working = supervisor.Working, waiting = supervisor.Waiting, accounts };
+        working = supervisor.Working, waiting = supervisor.Waiting, accounts, providers,
+        primeStatus = upkeep.PrimeStatus() };
 
     object Attach(JsonElement args, bool open)
     {
@@ -134,6 +148,7 @@ internal sealed class BackendHost
 
     async Task<bool> AskAsync(string title, string body)
     {
+        if (!settings.AskApproval) return true;
         // Only a response to a pending native prompt can authorize a start or new checks.
         var id = Guid.NewGuid().ToString("N");
         var pending = new TaskCompletionSource<bool>();
@@ -161,6 +176,8 @@ internal sealed class BackendHost
                 case "autoSwitch": settings.AutoSwitch = property.Value.GetBoolean(); break;
                 case "autoPrime": settings.AutoPrime = property.Value.GetBoolean(); break;
                 case "autoLine": settings.AutoLine = property.Value.GetBoolean(); break;
+                case "autoProjectAccount": settings.AutoProjectAccount = property.Value.GetBoolean(); break;
+                case "terminalFolder": settings.TerminalFolder = property.Value.ValueKind == JsonValueKind.Null ? null : Path.GetFullPath(property.Value.GetString()!); break;
                 case "refreshSeconds": settings.RefreshSeconds = Math.Clamp(property.Value.GetInt32(), 60, 3600); break;
                 default: throw new EngineException("Unsupported desktop setting: " + property.Name);
             }
@@ -205,6 +222,12 @@ internal sealed class BackendHost
             }
             catch (Exception e) { Program.Log(e); }
             supervisor.UpdateAccounts(accounts.Accounts, ProjectMap.Load(), live, ownBusy);
+            foreach (var provider in ProviderCli.All)
+            {
+                if (!ProviderCli.Present(provider)) continue;
+                try { providers[provider] = await engine.ListAsync(provider: provider); }
+                catch (Exception error) { Program.Log(error); }
+            }
             return true;
         }
         catch (Exception e)
