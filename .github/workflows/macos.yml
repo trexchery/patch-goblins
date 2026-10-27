@@ -19,6 +19,10 @@ jobs:
   native-orchestration:
     runs-on: macos-14
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,22 +32,22 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Python regression suite (synthetic credentials)
-        run: |
-          uv sync --locked --python python3.12
-          uv run --python python3.12 pytest -n 3 -o faulthandler_timeout=600
-      - name: Shared orchestration and process lifecycle
-        run: dotnet test dock/PatchGoblins.Backend.Tests/PatchGoblins.Backend.Tests.csproj --nologo --logger 'trx;LogFileName=macos-backend.trx'
+      - name: Install Python engine dependencies
+        run: uv sync --locked --python python3.12
+      - name: Shared orchestration and process lifecycle shard
+        run: python3 macos/test-backend.py --shard ${{ matrix.shard }} --count 4
       - name: Real desktop executable, private IPC, and owner approvals
         env:
           PATCH_GOBLINS_TEST_BACKEND: ${{ github.workspace }}/dock/PatchGoblins.Backend/bin/Debug/net8.0/patch-goblins-backend
-        run: uv run pytest tests/test_backend_host.py -n 0
+        run: uv run --python python3.12 pytest tests/test_backend_host.py -n 0
       - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-verification
-          path: '**/TestResults/*.trx'
+          name: macos-verification-${{ matrix.shard }}
+          path: |
+            TestResults/*.trx
+            TestResults/shard-*.json
           if-no-files-found: ignore
 
   apple-silicon:

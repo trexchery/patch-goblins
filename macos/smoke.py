@@ -3,9 +3,11 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def main(app: Path) -> None:
@@ -47,6 +49,37 @@ def main(app: Path) -> None:
             result.returncode, result.stdout, result.stderr,
         )
         print(marker)
+        # Exercise the real open/Terminal/.command path without invoking Claude.
+        repo = root / "synthetic repo 'quoted'"
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)],
+                       env=env, check=True, capture_output=True, timeout=15)
+        argv_file = root / "terminal-argv"
+        fake_engine = root / "synthetic engine.sh"
+        argv_temporary = argv_file.with_suffix(".tmp")
+        fake_engine.write_text("#!/bin/sh\numask 077\nprintf '%s\\n' \"$@\" > " +
+                               shlex.quote(str(argv_temporary)) + "\nmv -- " +
+                               shlex.quote(str(argv_temporary)) + " " + shlex.quote(str(argv_file)) + "\n")
+        fake_engine.chmod(0o700)
+        terminal_env = dict(env, PATCH_GOBLINS_ENGINE=str(fake_engine), PATCH_GOBLINS_ENGINE_ARGS="[]")
+        opened = subprocess.run([backend, "agents-terminal", "--repo", repo], env=terminal_env,
+                                text=True, capture_output=True, timeout=20)
+        assert opened.returncode == 0, (opened.returncode, opened.stdout, opened.stderr)
+        deadline = time.monotonic() + 15
+        while not argv_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert argv_file.exists(), "Terminal did not execute the private command file"
+        arguments = argv_file.read_text().splitlines()
+        assert arguments[0] == "run", arguments
+        paths = {flag: Path(arguments[arguments.index(flag) + 1])
+                 for flag in ("--settings", "--mcp-config", "--plugin-dir")}
+        settings = json.loads(paths["--settings"].read_text())
+        assert settings["theme"] == "custom:goblin:patch-goblins"
+        mcp = json.loads(paths["--mcp-config"].read_text())
+        assert mcp["mcpServers"]["patch-goblins"]["args"] == ["agents-mcp", "--repo", str(repo)]
+        assert (paths["--settings"].parent / "statusline.sh").is_file()
+        assert (paths["--plugin-dir"] / "themes" / "patch-goblins.json").is_file()
+        assert (paths["--plugin-dir"] / "commands" / "goal.md").is_file()
+        print("Native Terminal launch, quoted paths, MCP bridge and goblin theme: passed")
 
 
 if __name__ == "__main__":

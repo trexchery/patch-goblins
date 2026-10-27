@@ -592,7 +592,7 @@ def run(switcher, *, extension=None, app_name="claude-swap", icon=None) -> int:
             self.refresh_async()  # first display fetch
             if self.settings.auto_switch_enabled:
                 self._start_engine()
-            if extension is not None:
+            if extension is not None and not getattr(extension, "hosts_auto_switch", False):
                 extension.auto_switch_changed(self.settings.auto_switch_enabled)
 
         # ---- display refresh plumbing ----------------------------------------

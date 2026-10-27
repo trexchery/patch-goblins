@@ -45,7 +45,7 @@ def backend_command() -> list[str]:
     found = shutil.which("patch-goblins-backend")
     if found:
         return [found]
-    raise ClaudeSwitchError("Patch Goblins backend is missing. Install the complete .app or run macos/build.sh.")
+    raise ClaudeSwitchError("Patch Goblins backend is missing. Install the complete .app or run macos/build-macos.sh.")
 
 
 def child_environment() -> dict[str, str]:
@@ -285,6 +285,11 @@ class MenuExtension:
                 self._refresh()
             elif event == "ui_changed":
                 self._restart_count = 0
+                config = self.snapshot.get("config", {})
+                enabled = config.get("autoSwitch") if isinstance(config, dict) else None
+                if isinstance(enabled, bool) and app.settings.auto_switch_enabled != enabled:
+                    app.settings.auto_switch_enabled = enabled
+                    app.settings.save(app.switcher.backup_dir / "menubar_settings.json")
                 app.rebuild_menu()
                 if self.native_smoke and self.snapshot.get("schemaVersion") == 1 and isinstance(self.snapshot.get("accounts"), dict):
                     self._finish_smoke(app, True)

@@ -6,7 +6,10 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-from unittest.mock import patch
+import queue
+import time
+import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -102,6 +105,31 @@ def test_native_smoke_refuses_unisolated_account_stores(monkeypatch):
             goblins.main(["--native-smoke"])
     assert failure.value.code == 1
     native.assert_not_called()
+
+
+def test_backend_auto_switch_setting_updates_menu_without_rewriting_backend(monkeypatch, tmp_path):
+    from claude_swap.menubar import MenuBarSettings
+    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace())
+    client = MagicMock()
+    client.events = queue.Queue()
+    with patch("claude_swap.goblins.BackendClient", return_value=client):
+        extension = goblins.MenuExtension()
+    extension._last_refresh = time.monotonic()
+    extension.snapshot = {"config": {"autoSwitch": True}}
+    settings = MenuBarSettings(auto_switch_enabled=False)
+    settings.save = MagicMock(wraps=settings.save)
+    app = types.SimpleNamespace(settings=settings,
+                                switcher=types.SimpleNamespace(backup_dir=tmp_path),
+                                rebuild_menu=MagicMock())
+    client.events.put({"event": "ui_changed"})
+    extension.tick(app)
+    assert settings.auto_switch_enabled is True
+    assert json.loads((tmp_path / "menubar_settings.json").read_text())["auto_switch_enabled"] is True
+    settings.save.assert_called_once()
+    client.request.assert_not_called()
+    client.events.put({"event": "ui_changed"})
+    extension.tick(app)
+    settings.save.assert_called_once()  # an unchanged backend snapshot does not churn the file
 
 
 def test_terminal_command_quotes_paths_and_never_uses_shell(monkeypatch, tmp_path):
