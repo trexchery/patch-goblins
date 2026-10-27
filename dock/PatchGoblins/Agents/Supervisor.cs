@@ -600,11 +600,18 @@ public sealed partial class Supervisor : IDisposable
 
     /// The PreToolUse hook that runs Policy.Guard on every file tool call, with the folders the run may reach: its
     /// worktree, where Claude Code keeps its long tool outputs for that folder, and the owner's approved ones.
-    static object Guard(string worktree, string[] dirs)
+    static object Guard(string worktree, string[] dirs) => Guard(worktree, dirs, !OperatingSystem.IsWindows());
+
+    /// `posix`: macOS and Linux. The hook runs under sh there, so each argument is single-quoted and kept literally. Claude
+    /// Code keeps a folder's long tool outputs in `<tmp>/claude/<the folder's path, every other character a dash>`, where
+    /// `<tmp>` is /tmp (macOS: also /private/tmp, the same place) unless the temp folder differs.
+    internal static object Guard(string worktree, string[] dirs, bool posix)
     {
-        string[] roots = [worktree, Path.Combine(Path.GetTempPath(), "claude", Regex.Replace(Path.GetFullPath(worktree), "[^A-Za-z0-9]", "-")), .. dirs];
+        var kept = Regex.Replace(posix ? Policy.Full(worktree, "/", true) : Path.GetFullPath(worktree), "[^A-Za-z0-9]", "-");
+        string[] temps = posix ? [.. new[] { "/tmp", "/private/tmp", Path.GetTempPath().TrimEnd('/') }.Distinct().Select(t => $"{t}/claude/{kept}")] : [Path.Combine(Path.GetTempPath(), "claude", kept)];
+        string[] roots = [worktree, .. temps, .. dirs];
         string[] call = [Environment.ProcessPath!, "guard", .. roots];
-        var command = string.Join(' ', call.Select(a => $"\"{a.Replace('\\', '/')}\""));
+        var command = string.Join(' ', call.Select(a => posix ? "'" + a.Replace("'", @"'\''") + "'" : $"\"{a.Replace('\\', '/')}\""));
         return new { PreToolUse = Policy.GuardedTools.Select(t => new { matcher = t, hooks = new[] { new { type = "command", command } } }) };
     }
 
