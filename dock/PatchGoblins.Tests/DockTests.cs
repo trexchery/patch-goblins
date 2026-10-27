@@ -661,6 +661,8 @@ public class EngineIntegrationTests
 
 public class RenderTests
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+
     static IEnumerable<Control> All(Control c) => c.Controls.Cast<Control>().SelectMany(x => All(x).Prepend(x));
 
     static List<string> SectionLabels(Control c) =>
@@ -742,6 +744,16 @@ public class RenderTests
                 form.Render(snap, null);
                 Application.DoEvents();
 
+                // A refresh while the flyout is hidden must leave it hidden: WM_SETREDRAW TRUE sets WS_VISIBLE, which put a blank,
+                // never-activated (so never auto-hidden) flyout on the desktop.
+                form.Hide();
+                form.Render(snap, null, null, null, jobs);
+                Application.DoEvents();
+                Assert.False(IsWindowVisible(form.Handle));
+                form.Show();
+                form.Render(snap, null);
+                Application.DoEvents();
+
                 // Expanded row (accordion) must also lay out.
                 var row = FindRows(form).First();
                 row.SetExpanded(true, animate: false);
@@ -773,11 +785,11 @@ public class RenderTests
                 settings.Search.Text = "draft";
                 Assert.Equal(["Draft pull requests"], settings.VisibleRows);
                 settings.Search.Text = "upkeep switch";
-                Assert.Equal(["Auto-switch near limit", "Automatic switch line", "Switch at"], settings.VisibleRows);
+                Assert.Equal(["Auto-switch near limit", "Automatic switch line", "Switch at", "Random switch delay"], settings.VisibleRows);
                 settings.Search.Text = "approval";
                 Assert.Equal(["Ask for approval"], settings.VisibleRows);
                 settings.Search.Text = "";
-                Assert.Equal(13, settings.VisibleRows.Count());
+                Assert.Equal(14, settings.VisibleRows.Count()); // both "Random switch delay" and "Automatic switch line"
                 form.CloseSettings();
                 Assert.False(form.SettingsOpen);
                 Assert.True(form.Visible); // closing settings keeps the flyout open

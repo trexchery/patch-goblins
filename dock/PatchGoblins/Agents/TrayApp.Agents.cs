@@ -88,6 +88,8 @@ public sealed partial class TrayApp
             }
             if (double.TryParse(cfg.GetValueOrDefault("autoswitch.hysteresisPct"), NumberStyles.Float, CultureInfo.InvariantCulture, out var h))
                 _engineHysteresis = h;
+            if (int.TryParse(cfg.GetValueOrDefault("autoswitch.switchBufferSeconds"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var b))
+                _engineSwitchBuffer = b;
             ResumeStopped.Models = (cfg.GetValueOrDefault("autoswitch.model") ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (_agents != null) _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";

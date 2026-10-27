@@ -46,6 +46,11 @@ class AutoSwitchSettings:
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
+    # Random pause before a proactive switch (uniform in 0..this many
+    # seconds). It spreads a batch of accounts crossing the line over time
+    # instead of moving them all in the same instant. At-limit and failover
+    # switches skip it: there the account is already blocking work.
+    switch_buffer_seconds: int = 0
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
@@ -113,6 +118,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
             help="Minimum seconds between proactive switches",
+        ),
+        SettingSpec(
+            "autoswitch", "switchBufferSeconds", "switch_buffer_seconds", "int", 0, 300,
+            help="Random 0-N extra seconds before a proactive switch",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
@@ -428,6 +437,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("threshold", "threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
+        ("switch_buffer", "switch_buffer_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),

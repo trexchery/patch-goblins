@@ -124,8 +124,8 @@ public sealed partial class Engine(string exe)
     /// The two calls a usage-limit error makes, not queued behind the gate (an `auto --once` can hold it for ~30 s). Safe:
     /// the engine serializes what it mutates itself, as it must for several terminals (the store's FileLock, Claude Code's
     /// credential lock; `import-usage` under the usage store's), so only the call order is ours.
-    /// `--exclusive`: unattended, so the engine refuses an account a `cswap run` window holds rather than warn nobody.
-    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json", "--exclusive"], gated: false);
+    /// Not `--exclusive`: an account a `cswap run` window holds is still switched to (the engine warns; it refuses only when that profile's login is ahead).
+    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json"], gated: false);
 
     public async Task ImportUsageAsync(string document)
     {
@@ -146,6 +146,7 @@ public sealed partial class Engine(string exe)
     /// `threshold`: this tick's line instead of the engine's saved one (the tray's automatic line).
     public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync(double? threshold = null, CancellationToken ct = default)
     {
+        // Pocket the random switch buffer (up to its 300 s ceiling) on top of the usual fetch time.
         var r = await RunAsync(threshold is { } t
             ? ["auto", "--once", "--json", "--threshold", t.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)]
             : ["auto", "--once", "--json"], TimeSpan.FromSeconds(360), ct: ct);
@@ -236,7 +237,11 @@ public sealed partial class Engine(string exe)
     /// markers.
     internal static void TopLevel(IDictionary<string, string?> env, Func<IReadOnlyDictionary<string, string>?> fresh)
     {
-        if (env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)) && fresh() is { } clean)
+        // AI_AGENT too: a process started by one that already dropped the markers (a restarted tray) still carries the
+        // session's NO_COLOR, and every terminal it opened drew without colors.
+        if ((env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase))
+                || env.Any(v => v.Key.Equals("AI_AGENT", StringComparison.OrdinalIgnoreCase) && v.Value?.StartsWith("claude-code", StringComparison.OrdinalIgnoreCase) == true))
+            && fresh() is { } clean)
         {
             // Patch Goblins' own (an isolated instance's PATCH_GOBLINS_DATA) carry over: its terminals talk to it.
             var own = env.Where(v => v.Key.StartsWith("PATCH_GOBLINS_", StringComparison.OrdinalIgnoreCase) || v.Key.StartsWith("HANDOFF_", StringComparison.OrdinalIgnoreCase)).ToList();

@@ -28,6 +28,7 @@ public sealed partial class TrayApp : ApplicationContext
     readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
+    int _engineSwitchBuffer; // autoswitch.switchBufferSeconds, for the settings box
     double Threshold => _settings.AutoLine && _snap?.Accounts.FirstOrDefault(a => a.Active) is { } on
         ? _line.For(on, null) // the default login's automatic line
         : _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
@@ -417,7 +418,7 @@ public sealed partial class TrayApp : ApplicationContext
                 continue;
             }
             if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
-            var target = s.Idle ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
+            var target = s.Movable ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
                 line: _settings.AutoLine ? a => _line.For(a, s.Model) : null) : null;
             // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             var key = $"{s.SessionId}#{target}";
@@ -481,11 +482,9 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task<(bool AtLimit, string Label)?> MoveAsync(StoppedSession s, Account account, string dir, int? login)
     {
-        var closed = false;
         try
         {
-            // Copied before the window closes (a failed copy leaves it untouched), then again after claude
-            // exits so nothing it writes on the way out is left behind.
+            // Copied before anything opens (a failed copy leaves the window untouched), then again just before the new window launches.
             // The default login can change hands before `cswap run` looks (the engine, a limit hit), and it then runs in ~/.claude
             // instead of the profile: the transcript is put where either would look.
             string[] dirs = [.. new[] { dir, ResumeStopped.DefaultDir, ResumeStopped.ProfileDir(account.Number) }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase)];
@@ -502,30 +501,39 @@ public sealed partial class TrayApp : ApplicationContext
                 Program.Log($"move {s.SessionId} to #{account.Number} dropped: the login or the limits moved since the plan");
                 return null;
             }
-            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the close, which can wait 30 s: a concurrent switch must not pick this account meanwhile
-            await ResumeStopped.CloseAsync(s.Pid, s.Record);
-            closed = true;
-            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); }
+            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the launch, which can wait 10 s: a concurrent switch must not pick this account meanwhile
+            var spot = WindowSpot.Of(s.Pid); // the new window opens where this one is, on top of it
+            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); } // what the transcript holds now: the new window then owns it
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
-            for (var attempt = 0; ; attempt++)
+            // The new window first, the old one only once it is up: a launch that fails leaves the old window as it was.
+            var up = await WindowSpot.OpenAtAsync(spot, () =>
             {
-                try
+                for (var attempt = 0; ; attempt++)
                 {
-                    _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
-                        Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, ResumeStopped.Moved(s, account.Number))));
-                    break;
+                    try
+                    {
+                        _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
+                            Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s)));
+                        break;
+                    }
+                    catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more
                 }
-                catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more: the old window is already gone
+            });
+            // Someone typed or a turn started in the old window while the new one opened: it is not closed under them.
+            if (!up || !ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60))
+            {
+                Program.Log($"old window of {s.SessionId} kept: {(up ? "it was used while the new one opened" : "the new window was not seen")}");
+                Notify("Opened a new window; the old one is still open", $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} is on #{account.Number} in the new window. Close whichever you do not want.", ToolTipIcon.Warning);
+                return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
             }
+            await ResumeStopped.CloseAsync(s.Pid, s.Record);
             Program.Log($"nudge {s.SessionId} relaunched #{s.Account} on #{account.Number}");
             return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
         }
         catch (Exception e)
         {
             Program.Log(e);
-            // The window is gone and no record is left for a later pass: the owner gets the line that brings it back (no secrets in it).
-            if (closed) Notify("Could not reopen a stopped window", $"In {s.Cwd}: cswap run {account.Number} -- --resume {s.SessionId}", ToolTipIcon.Warning);
-            else Error("Could not reopen a stopped window", e);
+            Error("Could not reopen a stopped window", e); // the old window is still there: nothing closed before the new one was up
             return null;
         }
     }
@@ -593,11 +601,13 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e) { Program.Log(e); return false; }
         Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)" + (agents ? ", agent runs yield it" : ""));
         var closed = new List<StoppedSession>();
+        var spots = new Dictionary<string, WindowSpot?>();
         foreach (var w in windows)
         {
             // Someone typed, or a turn started: that window keeps the profile, so the switch refuses and the closed ones go back.
             if (!ResumeStopped.Unchanged(w) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)) break;
             if (w.Limit is { } old) _limitWatch.Remember(old.At);
+            spots[w.SessionId] = WindowSpot.Of(w.Pid);
             try { await ResumeStopped.CloseAsync(w.Pid, w.Record); closed.Add(w); }
             catch (Exception e) { Program.Log(e); break; }
         }
@@ -619,8 +629,8 @@ public sealed partial class TrayApp : ApplicationContext
         {
             try { ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); } catch (Exception e) { Program.Log(e); } // what it wrote on the way out
             _resumed[$"{w.SessionId}#{n}"] = _resumed[ResumeStopped.MoveStamp(w.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
-            _engine.LaunchConsole($"Claude · {account.ShortName} · moved", w.Cwd,
-                Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(w, moved: false)));
+            await WindowSpot.OpenAtAsync(spots.GetValueOrDefault(w.SessionId), () => _engine.LaunchConsole($"Claude · {account.ShortName} · moved", w.Cwd,
+                Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(w))));
             Program.Log($"nudge {w.SessionId} relaunched on #{n}");
         }
         try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
@@ -1032,6 +1042,7 @@ public sealed partial class TrayApp : ApplicationContext
         if (_engineThreshold == null) await ReadEngineThresholdAsync();
         if (_engineThreshold == null) { f.Dispose(); Error("Could not read engine settings", new EngineException("cswap config did not answer")); return; }
         f.Threshold.Value = Math.Clamp((decimal)_engineThreshold.Value, f.Threshold.Minimum, f.Threshold.Maximum);
+        f.SwitchBuffer.Value = Math.Clamp(_engineSwitchBuffer, (int)f.SwitchBuffer.Minimum, (int)f.SwitchBuffer.Maximum);
         f.AutoLine.Checked = _settings.AutoLine;
         f.AutoSwitch.Checked = _settings.AutoSwitch;
         f.Startup.Checked = Startup.IsEnabled();
@@ -1077,6 +1088,12 @@ public sealed partial class TrayApp : ApplicationContext
             {
                 await _engine.CommandAsync("config", "set", "autoswitch.threshold", threshold.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 await ReadEngineThresholdAsync(); // agents follow the engine's threshold
+            }
+            var buffer = (int)f.SwitchBuffer.Value;
+            if (buffer != _engineSwitchBuffer)
+            {
+                await _engine.CommandAsync("config", "set", "autoswitch.switchBufferSeconds", buffer.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await ReadEngineThresholdAsync();
             }
         }
         catch (Exception e) { _dash.CloseSettings(); Error("Could not save settings", e); }

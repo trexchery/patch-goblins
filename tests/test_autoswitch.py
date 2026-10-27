@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +31,8 @@ from claude_swap.autoswitch import (
     _recovery_is_useful,
     pct_label,
 )
+from claude_swap.exceptions import SwitchError
+from claude_swap.session import is_session_stale
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
@@ -46,6 +49,27 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class RecordingWait:
+    """Stands in for ``engine._stop``: records the wait instead of sleeping."""
+
+    def __init__(self, clock=None, advance: float = 0.0):
+        self.waits: list[float] = []
+        self.clock = clock
+        self.advance = advance
+
+    def wait(self, seconds: float) -> bool:
+        self.waits.append(seconds)
+        if self.clock is not None:
+            self.clock.advance(self.advance)
+        return False
+
+    def is_set(self) -> bool:
+        return False
+
+    def set(self) -> None:
+        pass
 
 
 def _iso_at(epoch: float) -> str:
@@ -477,6 +501,45 @@ class TestDecisionTable:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
+
+    def test_switch_buffer_waits_a_random_amount_for_proactive(self, temp_home):
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, switch_buffer_seconds=30)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        waits = RecordingWait()
+        h.engine._stop = waits
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert len(waits.waits) == 1
+        assert 0.0 <= waits.waits[0] <= 30.0
+
+    def test_switch_buffer_skips_at_limit_and_failover(self, temp_home):
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, switch_buffer_seconds=30, unhealthy_ticks=1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        waits = RecordingWait()
+        h.engine._stop = waits
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        # Failover: account 2 is active now, and its usage is unreadable.
+        assert h.tick_with_usage({
+            "2": None, "1": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert waits.waits == []
+
+    def test_switch_buffer_off_never_waits(self, harness):
+        waits = RecordingWait()
+        harness.engine._stop = waits
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert waits.waits == []
 
     def test_cooldown_expires(self, harness):
         harness.engine._mutate_state(
@@ -1898,24 +1961,10 @@ class TestFreshening:
         assert not h.state().get("quarantine")
         assert any(isinstance(e, ErrorEvent) for e in h.events)
 
-    def test_live_session_target_is_skipped_even_with_fresh_token(self, temp_home):
-        # Auto never activates an account that has a live `cswap run` session:
-        # dual refresh-token ownership with nobody reading the warning.
-        h = EngineHarness(temp_home)
-        h.seed(1, "a@example.com")
-        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
-        h.make_live("a@example.com", 1)
-        with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch(
-            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
-        ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
-        assert outcome is TickOutcome.BLOCKED
-        mock_refresh.assert_not_called()
-        assert h.active_number() == 1
-
-    def test_live_session_near_expiry_is_skipped(self, temp_home):
+    def test_live_session_target_is_switched_to_without_refreshing(self, temp_home):
+        # A window at its limit moves to any account with room, even one a
+        # `cswap run` session holds; its backup is not refreshed (the session
+        # holds that grant).
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=1)  # long expired
@@ -1926,9 +1975,138 @@ class TestFreshening:
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
-        assert outcome is TickOutcome.BLOCKED
+        assert outcome is TickOutcome.SWITCHED
         mock_refresh.assert_not_called()
-        assert h.active_number() == 1
+        assert h.active_number() == 2
+
+    def test_live_session_profile_ahead_falls_to_the_next_candidate(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        real = h.switcher.switch_to
+
+        def refuse_two(number, **kw):
+            if number == "2":
+                raise SwitchError("profile ahead of the backup")
+            return real(number, **kw)
+
+        with patch.object(
+            h.switcher, "live_session_pids_for", side_effect=lambda n, e: [4242] if n == "2" else []
+        ), patch.object(h.switcher, "switch_to", side_effect=refuse_two):
+            outcome = h.tick_with_usage(
+                {"1": _usage(95), "2": _usage(10), "3": _usage(40)}
+            )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+class TestFollowLogins:
+    """The default login and its live `cswap run` window share one login."""
+
+    HOUR = 3_600_000
+
+    def _rig(self, temp_home, default_exp, profile_exp):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=default_exp)
+        h.make_live("a@example.com", 1)
+        creds = temp_home / ".claude" / ".credentials.json"
+        creds.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "at-default", "refreshToken": "rt-default", "expiresAt": default_exp},
+            "mcpOAuth": {"keep": "default"},
+        }))
+        sdir = h.switcher._session_dir("1", "a@example.com")
+        sdir.mkdir(parents=True)
+        prof = sdir / ".credentials.json"
+        prof.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "at-profile", "refreshToken": "rt-profile", "expiresAt": profile_exp},
+            "mcpOAuth": {"keep": "profile"},
+        }))
+        return h, creds, prof
+
+    @staticmethod
+    def _login(path):
+        doc = json.loads(path.read_text())
+        return doc["claudeAiOauth"]["refreshToken"], doc["mcpOAuth"]["keep"]
+
+    def test_newer_window_login_is_copied_to_the_default(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 3 * self.HOUR, now + 4 * self.HOUR)
+        with patch.object(h.switcher, "_live_session_pids", return_value=[4242]):
+            assert h.switcher.follow_logins() == {"status": "synced"}
+        assert self._login(creds) == ("rt-profile", "default")  # only the login moved; its other fields stayed
+        assert self._login(prof) == ("rt-profile", "profile")
+
+    def test_newer_default_login_is_copied_to_the_window(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 4 * self.HOUR, now + 3 * self.HOUR)
+        with patch.object(h.switcher, "_live_session_pids", return_value=[4242]):
+            assert h.switcher.follow_logins() == {"status": "synced"}
+        assert self._login(prof) == ("rt-default", "profile")
+
+    def test_no_live_window_leaves_both_alone(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 3 * self.HOUR, now + 4 * self.HOUR)
+        with patch.object(h.switcher, "_live_session_pids", return_value=[]):
+            assert h.switcher.follow_logins() == {"status": "alone"}
+        assert self._login(creds)[0] == "rt-default"
+
+    def test_unreadable_window_login_is_never_overwritten(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 3 * self.HOUR, now + 4 * self.HOUR)
+        prof.write_text("{not json")
+        with patch.object(h.switcher, "_live_session_pids", return_value=[4242]):
+            h.switcher.follow_logins()
+        assert prof.read_text() == "{not json"
+
+    def test_a_login_about_to_expire_is_refreshed_once_for_both(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 10 * 60_000, now + 12 * 60_000)  # inside the 20-minute window
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-fresh", "refreshToken": "rt-fresh", "expiresAt": now + 8 * self.HOUR}})
+        with patch.object(h.switcher, "_live_session_pids", return_value=[4242]), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(fresh, None),
+        ) as refresh:
+            assert h.switcher.follow_logins() == {"status": "refreshed"}
+        assert refresh.call_count == 1
+        assert self._login(creds) == ("rt-fresh", "default")
+        assert self._login(prof) == ("rt-fresh", "profile")
+        # what Claude Code will see next: nothing near expiry, so neither window refreshes on its own
+        assert json.loads(prof.read_text())["claudeAiOauth"]["expiresAt"] > now + 7 * self.HOUR
+        assert not is_session_stale(prof.parent)
+
+    def test_a_failed_refresh_changes_nothing(self, temp_home):
+        now = int(time.time() * 1000)
+        h, creds, prof = self._rig(temp_home, now + 10 * 60_000, now + 12 * 60_000)
+        with patch.object(h.switcher, "_live_session_pids", return_value=[4242]), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
+        ):
+            assert h.switcher.follow_logins()["status"] == "refresh-failed"
+        assert self._login(prof)[0] == "rt-profile" and self._login(creds)[0] == "rt-profile"  # the newest copy still reached both
+
+    def test_switching_onto_a_held_account_starts_from_the_windows_login(self, temp_home):
+        from types import SimpleNamespace
+
+        now = int(time.time() * 1000)
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=now + 3 * self.HOUR)
+        h.seed(2, "b@example.com", expires_at=now + 3 * self.HOUR)
+        h.make_live("a@example.com", 1)
+        sdir = h.switcher._session_dir("2", "b@example.com")
+        sdir.mkdir(parents=True)
+        (sdir / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "at-win", "refreshToken": "rt-win", "expiresAt": now + 5 * self.HOUR}}))
+        (sdir / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"}}))
+        with patch("claude_swap.session.scan_live_sessions", return_value=([SimpleNamespace(pid=4242)], 0)), patch(
+            "claude_swap.session.live_run_marker_pids", return_value=[]
+        ), patch.object(h.switcher, "_live_session_pids", return_value=[4242]):
+            result = h.switcher.switch_to("2", json_output=True)
+        assert result["switched"]
+        live = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-win"  # the window's generation, not the consumed backup
 
 
 class TestQuarantineLifecycle:
@@ -2879,6 +3057,40 @@ class TestConsumeFirstStrategy:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
         assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_a_switch_buffered_past_the_serve_ttl_holds(self, temp_home):
+        # The phase-2 refetch is fresh at the gate, but the random wait can
+        # outlive SERVE_TTL_S: act only on data still inside it.
+        h = self._harness(temp_home)
+        h.settings = replace(h.settings, switch_buffer_seconds=300)
+        h.engine.settings = h.settings
+        h.engine._stop = RecordingWait(clock=h.clock, advance=301)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "stale-usage"
+        ]
+
+    def test_no_buffer_wait_when_the_active_is_at_its_hard_limit(self, temp_home):
+        # A consume-first move forced by an exhausted active is the same
+        # "already blocking work" state the at-limit trigger names.
+        h = self._harness(temp_home)
+        h.settings = replace(h.settings, switch_buffer_seconds=300)
+        h.engine.settings = h.settings
+        waits = RecordingWait()
+        h.engine._stop = waits
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 100, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert waits.waits == []
 
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)

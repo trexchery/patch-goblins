@@ -141,8 +141,10 @@ public class ResumeStoppedTests
     [Fact]
     public void FinishedTurnReopensWithoutAPrompt()
     {
-        Assert.Equal(["--resume", "id"], ResumeStopped.ResumeArgs(Done3, moved: true));
-        Assert.Equal(["--resume", "id", ResumeStopped.Prompt(true)], ResumeStopped.ResumeArgs(On(3), moved: true));
+        Assert.Equal(["--resume", "id"], ResumeStopped.ResumeArgs(Done3));
+        Assert.Equal(["--resume", "id", ResumeStopped.Prompt], ResumeStopped.ResumeArgs(On(3)));
+        // Moved from a shell: told its background commands still run, so it doesn't start them twice.
+        Assert.Equal(["--resume", "id", ResumeStopped.Prompt + ResumeStopped.Background], ResumeStopped.ResumeArgs(On(3) with { Status = "shell" }));
     }
 
     [Fact]
@@ -413,10 +415,6 @@ public class ResumeStoppedTests
         Assert.True(ResumeStopped.OwnStop(true, at, at.UtcDateTime.AddSeconds(-60)));
         Assert.False(ResumeStopped.OwnStop(true, at, DateTime.MaxValue));
         Assert.True(ResumeStopped.OwnStop(false, at, at.UtcDateTime.AddSeconds(10)));
-        var before = Refused(at.AddHours(1), own: false);
-        Assert.True(ResumeStopped.Moved(before, 3)); // reopened on the account it is labelled with, but not the one that refused
-        Assert.Contains("on another account", ResumeStopped.Prompt(ResumeStopped.Moved(before, 3)));
-        Assert.False(ResumeStopped.Moved(Refused(at.AddHours(1)), 3));
     }
 
     [Fact]
@@ -522,7 +520,7 @@ public class ResumeStoppedTests
             Assert.False(File.Exists(record)); // killed, Claude Code would leave it for a reused pid to revive
             ResumeStopped.CopyTranscript(s, to);
             Assert.Equal(File.ReadAllText(transcript), File.ReadAllText(Path.Combine(to, "projects", "C--w", "sid.jsonl")));
-            Assert.Equal(["run", "1", "--", "--resume", "sid"], Launch.Run(1, false, ResumeStopped.ResumeArgs(s, moved: true)));
+            Assert.Equal(["run", "1", "--", "--resume", "sid"], Launch.Run(1, false, ResumeStopped.ResumeArgs(s)));
         }
         finally
         {

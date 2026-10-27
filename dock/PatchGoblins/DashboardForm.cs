@@ -223,8 +223,10 @@ public sealed class DashboardForm : Form
         if (shown == _shown && _list.Controls.Count > 0) return;
         _shown = shown;
         ApplyTheme();
-        // Painting off while the rows are rebuilt, then one paint: no row-by-row flash.
-        if (IsHandleCreated) SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 0, 0);
+        // Painting off while the rows are rebuilt, then one paint: no row-by-row flash. Shown only: WM_SETREDRAW on sets
+        // WS_VISIBLE, which put a hidden flyout on screen blank and never activated, so never hidden again.
+        var redraw = IsHandleCreated && Visible;
+        if (redraw) SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 0, 0);
         _list.SuspendLayout();
         // Copy first: Dispose removes the control, so enumerating live would skip every other one.
         foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
@@ -273,7 +275,7 @@ public sealed class DashboardForm : Form
         }
         _list.ResumeLayout();
         FitHeight();
-        if (IsHandleCreated)
+        if (redraw)
         {
             SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 1, 0);
             Refresh();

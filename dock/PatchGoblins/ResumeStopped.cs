@@ -9,12 +9,15 @@ namespace PatchGoblins;
 /// A Claude Code window waiting for someone to type: stopped on a usage-limit error (`AtLimit`), or done
 /// with its turn. `Record` and `Seen` (the transcript's write time) let the move check nothing changed since.
 /// `Limit` is the error as recorded; `OwnRefused`: the API refused the window's own account (not one it was
-/// only labelled with after a switch). `Status` is the record's: only an `idle` window is ever closed.
+/// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
     string? Model = null)
 {
     public bool Idle => Status == "idle";
+    /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
+    /// so the background command runs on to its end (the reopened window is told).
+    public bool Movable => Idle || AtLimit && Status == "shell";
 }
 
 /// A usage-limit stop as Claude Code recorded it: the window that ran out ("five_hour", "seven_day", ...), when it
@@ -37,18 +40,15 @@ public static class ResumeStopped
     public const double PerWindow = 10;
     /// A window moved this often within an hour is left where it is: it keeps stopping, and reopening it again won't help.
     public const int MovesPerHour = 3;
-    public static string Prompt(bool moved) =>
-        "This session stopped at a usage limit and Patch Goblins reopened it" + (moved ? " on another account" : " now that the limit has reset") +
-        ". Continue exactly where you left off.";
+    public const string Prompt = "A usage limit was hit. Continue.";
 
     /// Claude args that reopen `s` on another account: a stopped turn is told to carry on, a finished one
     /// just waits for its user again.
-    public static string[] ResumeArgs(StoppedSession s, bool moved) =>
-        s.AtLimit ? ["--resume", s.SessionId, Prompt(moved)] : ["--resume", s.SessionId];
+    public static string[] ResumeArgs(StoppedSession s) =>
+        s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
 
-    /// Whether the reopened window is on another account than the one that refused it. A default-login stop from
-    /// before a switch is: its label already names the new default, but the account that said no was the old one.
-    public static bool Moved(StoppedSession s, int target) => target != s.Account || s.AtLimit && !s.OwnRefused;
+    /// Said to a window moved while its background commands ran: they still do, so it doesn't start them twice.
+    public const string Background = " Its background commands are still running.";
 
     /// The `autoswitch.model` names whose weekly windows the engine also decides on ("all": every one), read with its threshold.
     public static IReadOnlySet<string> Models { get; set; } = new HashSet<string>();
@@ -223,6 +223,10 @@ public static class ResumeStopped
                 var refused = r.TryGetProperty("apiErrorParams", out var p) && p.ValueKind == JsonValueKind.Object
                     && p.TryGetProperty("rate_limit_info", out info) && info.ValueKind == JsonValueKind.Object;
                 var text = r.TryGetProperty("message", out var m) ? m.ToString() : "";
+                // "You've reached your Fable limit. Run /usage-credits…": a model's own limit, with no reset time; named for the model's window.
+                var credits = Str(r, "apiError") == "model_requires_usage_credits";
+                if (credits) return new Limit(Regex.Match(text, @"reached your (\w+) limit") is { Success: true } name ? name.Groups[1].Value : "model", null,
+                    r.TryGetProperty("timestamp", out var cts) && cts.ValueKind == JsonValueKind.String && cts.TryGetDateTimeOffset(out var ct) ? ct : default);
                 if (Str(r, "apiError") != "usage_limit_reached" && !(refused && Str(info, "status") == "rejected")
                     && !(text.Contains("limit", StringComparison.OrdinalIgnoreCase)
                         && (text.Contains("hit your", StringComparison.OrdinalIgnoreCase) || text.Contains("usage", StringComparison.OrdinalIgnoreCase)))) return null;
@@ -311,7 +315,8 @@ public static class ResumeStopped
             && scopedRefused.Any(r => r.Key.Account == a.Number && m.Contains(r.Key.Scope, StringComparison.OrdinalIgnoreCase) && r.Value > (now ?? DateTimeOffset.UtcNow));
         bool Room(Account a) => Read(a) && Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow)) && !ModelRefused(a);
         var own = accounts.FirstOrDefault(a => a.Number == s.Account);
-        var refused = s.OwnRefused && s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow);
+        // A model's own refusal without a reset time ("Fable", from usage credits) holds until the reading says otherwise: never reopened where it was refused.
+        var refused = s.OwnRefused && (s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow) || s.Limit is { ResetsAt: null, Window: not (null or "five_hour" or "seven_day") });
         if (s.AtLimit && own != null && Room(own) && !refused) return own.Number;
         if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < Line(own))) return null;
         // A move before the limit leaves alone the account the default login, near its own line, would switch to: a window moved
@@ -347,15 +352,16 @@ public static class ResumeStopped
         dir != DefaultDir && int.TryParse(Path.GetFileName(dir.TrimEnd('\\', '/')).Split('-')[0], out var n) ? n : null;
 
     /// Where the default login can move when `refused` ran out, best (most room) first. Usage read and below full; enabled;
-    /// not refused until a reset still ahead, whatever a reading older than the refusal says; and not run by a `cswap run`
-    /// window (`liveProfiles`): two live copies of one rotating login would strand one. The switch itself is `--exclusive`, so the engine refuses it too.
+    /// not refused until a reset still ahead, whatever a reading older than the refusal says. An account a `cswap run` window
+    /// holds (`liveProfiles`) is only tried after the others (two live copies of one rotating login can strand one), never
+    /// left out: a window at its limit moves to any account with room. The engine refuses it if the profile's login is ahead.
     /// Below the engine's `threshold` first (above it the engine would switch again at once); only if none, anything below full.
     public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
         IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
     {
         var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Peak(a) < Full
-                && !liveProfiles.Contains(a.Number) && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
-        return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => Peak(a)).Select(a => a.Number)];
+                && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
+        return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => liveProfiles.Contains(a.Number)).ThenBy(a => Peak(a)).Select(a => a.Number)];
     }
 
     /// When the first account frees up: the soonest reset ahead among the accounts refused and the windows read as full.
@@ -502,8 +508,8 @@ public static class ResumeStopped
         return found;
     }
 
-    /// What one scanned window gets in a pass. `Ignore`: nothing due. `Left`: busy or in a shell at its limit, never closed (its
-    /// background work would die): told about once, moved when idle. `Wait`: look again on the next poll (waiting on a dialog, someone typing,
+    /// What one scanned window gets in a pass. `Ignore`: nothing due. `Left`: busy at its limit, never closed (its turn
+    /// is still running): told about once, moved when idle. `Wait`: look again on the next poll (waiting on a dialog, someone typing,
     /// or it changed since the scan). `NoRoom`, `Recent` (reopened there under ten minutes ago), `Capped` (`MovesPerHour`): left as it is.
     /// `Move`: close and reopen it on `target`.
     public enum Step { Ignore, Left, Wait, NoRoom, Recent, Capped, Move }
@@ -512,7 +518,7 @@ public static class ResumeStopped
     /// A finished turn moves only off the default login, and only after a minute without input anywhere.
     public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged)
     {
-        if (!s.Idle) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
+        if (!s.Movable) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
         if (!s.AtLimit && (s.ConfigDir == DefaultDir || userIdle < TimeSpan.FromSeconds(60))) return Step.Ignore;
         if (s.AtLimit && userIdle < typingPause) return Step.Wait;
         if (target == null) return Step.NoRoom;
@@ -547,7 +553,7 @@ public static class ResumeStopped
             if (s.Record == null) return true;
             using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
             var r = doc.RootElement;
-            return Str(r, "status") == "idle" && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
+            return s.Movable && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
