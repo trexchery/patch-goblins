@@ -95,7 +95,7 @@ public class PosixPolicyTests
         File.WriteAllText(Path.Combine(store, "agents", "state.json"), "{}");
         string Rule(string p) => "/" + p;
         List<string> notes = [];
-        var rules = Policy.Confine(["Read(~/Library/Application Support/patch-goblins/agents/*)", "Read(//etc/passwd)", "Read(~/library/application support/patch-goblins/agents/*)", "Bash(cswap *)"], wt, home, notes);
+        var rules = Policy.Confine(["Read(~/Library/Application Support/patch-goblins/agents/*)", "Read(//etc/passwd)", "Read(~/library/application support/patch-goblins/agents/*)", "Bash(cswap *)"], wt, home, notes, posix: true, mac: false);
         Assert.Equal(new[]
         {
             "Read(//etc/passwd)", "Bash(cswap *)",
@@ -105,6 +105,90 @@ public class PosixPolicyTests
             $"Edit({Rule(Path.Combine(wt, ".claude", "settings.json"))})", $"Edit({Rule(Path.Combine(wt, ".claude", "settings.local.json"))})",
         }.Order(), rules.Order());
         Assert.All(rules.Where(r => r.StartsWith("Read(/") || r.StartsWith("Edit(/")), r => Assert.StartsWith("//", r[(r.IndexOf('(') + 1)..]));
+        Assert.Single(notes);
+    }
+
+    const string Home = "/Users/nicolas", Store = "/Users/nicolas/Library/Application Support/patch-goblins";
+
+    static string? AddDirsError(string dir, bool mac) =>
+        Record.Exception(() => Policy.CheckAddDirs([dir], "local", Home, Store, posix: true, mac: mac))?.Message;
+
+    [Theory]
+    [InlineData("/users/nicolas")] // another case of the user folder
+    [InlineData("/USERS/NICOLAS/")]
+    [InlineData("/users/nicolas/library/application support/PATCH-goblins")] // Patch Goblins' own folder
+    [InlineData("/users/nicolas/library/APPLICATION SUPPORT")] // one that holds it
+    [InlineData("/Users")] // one that holds the user folder
+    [InlineData("/users/")]
+    public void OnMacACaseVariantOfTheUserOrPatchGoblinsFolderIsRefusedAsAnAddDir(string dir) =>
+        Assert.Contains("never a drive, the user folder or Patch Goblins' own", AddDirsError(dir, mac: true));
+
+    [Theory]
+    [InlineData("/Users/nicolas/Library/Application Support/patch-goblins/x")]
+    [InlineData("/Users/nicolas//Library/../.")] // double slashes, `.` and `..` are resolved first
+    [InlineData("/Users/nicolas/../")]
+    [InlineData("/Users//NICOLAS/./x/..")]
+    [InlineData("/")]
+    [InlineData("/.")]
+    [InlineData("//")]
+    [InlineData("/x/..")]
+    [InlineData("~")] // not a full path: there is no `~` expansion here
+    [InlineData("~/shared")]
+    [InlineData("shared")]
+    [InlineData("./shared")]
+    [InlineData("/Users/shared/$HOME")]
+    public void OtherSpellingsOfTheSameFoldersAreRefusedOnMacAndOnLinux(string dir)
+    {
+        foreach (var mac in new[] { true, false })
+            if (!dir.Contains("NICOLAS")) Assert.NotNull(AddDirsError(dir, mac)); // exact-case spellings are refused on Linux as well
+        Assert.NotNull(AddDirsError(dir, mac: true));
+    }
+
+    [Theory]
+    [InlineData("/users/nicolas")] // Linux: another case is another folder, and stays accepted
+    [InlineData("/USERS/NICOLAS/Library/Application Support/patch-goblins")]
+    [InlineData("/Users/Nicolas")]
+    public void OnLinuxCaseVariantsStayDistinctFolders(string dir) => Assert.Null(AddDirsError(dir, mac: false));
+
+    [Theory]
+    [InlineData("/Users/Nicolas/Documents/lib", true)] // a folder below the user folder is fine, in any case
+    [InlineData("/Users/shared/lib", true)]
+    [InlineData("/Users/shared/lib/", true)]
+    [InlineData("/Volumes/Work/Lib", true)]
+    [InlineData("/Volumes/Work/Lib", false)]
+    [InlineData("/users/shared/lib", false)]
+    [InlineData("/tmp/x", true)] // /tmp is /private/tmp on macOS: links are not followed, so this stays a /tmp guard root only
+    public void OrdinaryFoldersAreStillAccepted(string dir, bool mac) => Assert.Null(AddDirsError(dir, mac));
+
+    [Theory]
+    [InlineData("Read", """{"file_path":"/USERS/x/.ssh/id_ed25519"}""", 2)]
+    [InlineData("Read", """{"file_path":"/users/x/wt/K-21/../../.SSH/k"}""", 2)]
+    [InlineData("Read", """{"file_path":"/Users/x/wt/k-2/a"}""", 2)] // still no prefix match
+    [InlineData("Read", """{"file_path":"/Users/x/wt/K-210/a"}""", 2)]
+    [InlineData("Glob", """{"pattern":"/USERS/**"}""", 2)]
+    [InlineData("Write", """{"file_path":"/ETC/hosts"}""", 2)]
+    [InlineData("Read", """{"file_path":"/Users/x/WT/K-21/package.json"}""", 0)] // the same folder on this volume
+    [InlineData("Edit", """{"file_path":"/USERS/X/SHARED/lib/x.ts"}""", 0)]
+    public void OnMacTheGuardComparesIgnoringCaseSoVariantSpellingsOfDeniedPathsAreDenied(string tool, string input, int exit) =>
+        Assert.Equal(exit, Policy.Guard(Roots, JsonSerializer.Serialize(new { cwd = "/Users/x/wt/k-21", tool_name = tool, tool_input = JsonDocument.Parse(input).RootElement }), TextWriter.Null, posix: true, mac: true));
+
+    [Fact]
+    public void OnMacACaseVariantRuleStillNarrowsAndCoversUsesTheSameRule()
+    {
+        Assert.True(Policy.Covers("/a/b", "/A/B/c", posix: true, mac: true));
+        Assert.False(Policy.Covers("/a/b", "/A/B/c", posix: true, mac: false));
+        Assert.True(Policy.Glob("/Users/x/p/*", "/users/X/P/agents", posix: true, mac: true));
+        Assert.False(Policy.Glob("/Users/x/p/*", "/users/X/P/agents", posix: true));
+        if (OperatingSystem.IsWindows()) return; // Confine reads real folders: runs where paths are POSIX
+        using var tmp = new TempDir();
+        var wt = Path.Combine(tmp.Path, "home", "Store", "agents", "wt", "k-21");
+        Directory.CreateDirectory(wt);
+        Directory.CreateDirectory(Path.Combine(tmp.Path, "home", "Store", "agents", "runs"));
+        var rule = "Read(~/store/AGENTS/*)";
+        var notes = new List<string>();
+        Assert.Contains(rule, Policy.Confine([rule], wt, Path.Combine(tmp.Path, "home"), notes, posix: true, mac: false));
+        Assert.Empty(notes);
+        Assert.DoesNotContain(rule, Policy.Confine([rule], wt, Path.Combine(tmp.Path, "home"), notes, posix: true, mac: true));
         Assert.Single(notes);
     }
 }
