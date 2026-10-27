@@ -696,7 +696,7 @@ public class RenderTests
         {
             try
             {
-                using var form = new DashboardForm();
+                using var form = new DashboardForm { WorkAreaHeight = 1080 }; // not the runner's display: a small one caps the flyout and hides its growth
                 form.Render(snap, null, null, null, jobs);
                 form.SetStatus("12:00");
                 Assert.Equal("", form.StatusText); // a refresh time is not news: the header says nothing until the team does
@@ -826,7 +826,7 @@ public class RenderTests
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
-        if (failure != null) throw failure;
+        if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
     /// A row lists its account's project folders in the expanded view when they fit on a line,
@@ -883,7 +883,7 @@ public class RenderTests
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
-        if (failure != null) throw failure;
+        if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
     /// Regression: a refresh re-renders (disposing every row) while a row's menu is open.
@@ -924,6 +924,6 @@ public class RenderTests
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
-        if (failure != null) throw failure;
+        if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 }
