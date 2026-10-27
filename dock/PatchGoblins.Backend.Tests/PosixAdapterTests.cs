@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using PatchGoblins;
@@ -8,6 +9,41 @@ namespace PatchGoblins.Tests;
 
 public sealed class PosixAdapterTests
 {
+    [Fact]
+    public async Task AStaleRecoveryRecordNeverKillsAnUnrelatedProcessGroup()
+    {
+        using var tmp = new TempDir();
+        var previous = Environment.GetEnvironmentVariable("PATCH_GOBLINS_DATA");
+        Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", tmp.Path);
+        var python = Engine.FindOnPath("python3")!;
+        using var unrelated = Process.Start(new ProcessStartInfo(python,
+            ["-c", "import os,time; os.setsid(); print('ready',flush=True); time.sleep(60)"])
+            { UseShellExecute = false, RedirectStandardOutput = true })!;
+        try
+        {
+            Assert.Equal("ready", await unrelated.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+            var job = "stale-" + Guid.NewGuid().ToString("N");
+            var records = Path.Combine(tmp.Path, "processes");
+            Directory.CreateDirectory(records);
+            var name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(job))).ToLowerInvariant() + ".json";
+            File.WriteAllText(Path.Combine(records, name), JsonSerializer.Serialize(new
+            {
+                pid = unrelated.Id,
+                started = (unrelated.StartTime.ToUniversalTime() - DateTime.UnixEpoch).TotalSeconds,
+                exitCode = (int?)null,
+            }));
+            AgentProcess.Reap(job);
+            await Task.Delay(100);
+            Assert.False(unrelated.HasExited);
+        }
+        finally
+        {
+            if (!unrelated.HasExited) unrelated.Kill(entireProcessTree: true);
+            await unrelated.WaitForExitAsync();
+            Environment.SetEnvironmentVariable("PATCH_GOBLINS_DATA", previous);
+        }
+    }
+
     [Fact]
     public void HardeningRetainsWorktreeExecutablesAndDoesNotFollowLinks()
     {

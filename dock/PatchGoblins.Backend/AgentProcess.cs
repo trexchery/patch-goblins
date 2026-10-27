@@ -100,6 +100,7 @@ public sealed class AgentProcess : IDisposable
             using var process = Process.GetProcessById(pid);
             var started = DateTimeOffset.FromUnixTimeMilliseconds((long)(state.RootElement.GetProperty("started").GetDouble() * 1000));
             if (Math.Abs((process.StartTime.ToUniversalTime() - started.UtcDateTime).TotalSeconds) > 2) return;
+            if (!IsHostFor(pid, path)) return;
             KillGroup(pid, 9);
         }
         catch (Exception e) when (e is ArgumentException or IOException or JsonException or InvalidOperationException or Win32Exception) { }
@@ -235,6 +236,16 @@ public sealed class AgentProcess : IDisposable
             return !existing.HasExited && Math.Abs((existing.StartTime.ToUniversalTime() - started.UtcDateTime).TotalSeconds) <= 2;
         }
         catch (Exception e) when (e is ArgumentException or IOException or JsonException or InvalidOperationException or Win32Exception) { return false; }
+    }
+
+    static bool IsHostFor(int pid, string path)
+    {
+        using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-ww", "-p", pid.ToString(), "-o", "command="])
+        { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true });
+        if (ps == null) return false;
+        var command = ps.StandardOutput.ReadToEnd();
+        ps.WaitForExit(3000);
+        return ps.ExitCode == 0 && command.Contains("worker_host.py", StringComparison.Ordinal) && command.Contains(path, StringComparison.Ordinal);
     }
     static void Kill(int pid, int signal) { if (pid > 1) kill(pid, signal); }
     static void KillGroup(int group, int signal) { if (group > 1 && group != Environment.ProcessId) kill(-group, signal); }

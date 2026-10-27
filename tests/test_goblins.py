@@ -94,6 +94,16 @@ def test_engine_dispatch_happens_without_loading_native_ui(monkeypatch):
     assert sys.argv == ["cswap", "list", "--json"]
 
 
+def test_native_smoke_refuses_unisolated_account_stores(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("PATCH_GOBLINS_SMOKE_HOME", raising=False)
+    with patch("claude_swap.menubar.run") as native:
+        with pytest.raises(SystemExit) as failure:
+            goblins.main(["--native-smoke"])
+    assert failure.value.code == 1
+    native.assert_not_called()
+
+
 def test_terminal_command_quotes_paths_and_never_uses_shell(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

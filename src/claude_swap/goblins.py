@@ -214,7 +214,7 @@ def add_account() -> str:
 class MenuExtension:
     hosts_auto_switch = True
 
-    def __init__(self):
+    def __init__(self, *, native_smoke=False):
         self.client = BackendClient()
         self.snapshot: dict = {}
         self._refreshing = False
@@ -222,6 +222,9 @@ class MenuExtension:
         self._stopped = False
         self._restart_at = 0.0
         self._restart_count = 0
+        self.native_smoke = native_smoke
+        self.smoke_passed = False
+        self._smoke_deadline = time.monotonic() + 20
 
     def start(self, app):
         self.client.start()
@@ -250,6 +253,9 @@ class MenuExtension:
 
     def tick(self, app):
         import rumps
+        if self.native_smoke and time.monotonic() > self._smoke_deadline:
+            self._finish_smoke(app, False)
+            return
         while True:
             try:
                 message = self.client.events.get_nowait()
@@ -263,8 +269,12 @@ class MenuExtension:
                                        message=message.get("body", ""), ok="Approve", cancel="Cancel") == 1
                 self._background(lambda m=message, yes=approved: self.client.request("approval", {"id": m["id"], "approved": yes}))
             elif event == "notify":
-                rumps.notification("Patch Goblins", message.get("title", ""), message.get("body", ""))
+                if not self.native_smoke:
+                    rumps.notification("Patch Goblins", message.get("title", ""), message.get("body", ""))
             elif event == "ui_error":
+                if self.native_smoke:
+                    self._finish_smoke(app, False)
+                    return
                 rumps.alert(title="Patch Goblins", message=message["message"])
             elif event == "stopped":
                 self._stopped = True
@@ -276,11 +286,24 @@ class MenuExtension:
             elif event == "ui_changed":
                 self._restart_count = 0
                 app.rebuild_menu()
+                if self.native_smoke and self.snapshot.get("schemaVersion") == 1 and isinstance(self.snapshot.get("accounts"), dict):
+                    self._finish_smoke(app, True)
+                    return
         if self._stopped and self._restart_count < 3 and time.monotonic() >= self._restart_at:
             self._restart_count += 1
             self._guard(self.restart)
-        if time.monotonic() - self._last_refresh > 15:
+        if time.monotonic() - self._last_refresh > (0.5 if self.native_smoke else 15):
             self._refresh()
+
+    def _finish_smoke(self, app, passed):
+        self.smoke_passed = passed
+        if passed:
+            print("Native menu bar, supervisor bridge and bundled credential engine: passed", flush=True)
+            app.on_quit(None)
+        else:
+            print("Native menu/backend smoke failed to obtain an account snapshot", file=sys.stderr, flush=True)
+            self.stop()
+            os._exit(1)  # testing only, isolated HOME verified before any native startup
 
     def restart(self):
         self.client.close()
@@ -387,6 +410,7 @@ def main(argv=None):
     parser.add_argument("--tui", action="store_true", help="Open the work dashboard (menu bar must be running)")
     parser.add_argument("--accounts", action="store_true", help="Open the existing account dashboard")
     parser.add_argument("--add-account", action="store_true", help="Sign in through the official Claude CLI in an isolated profile")
+    parser.add_argument("--native-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--repo", default=os.getcwd())
     options = parser.parse_args(args)
     try:
@@ -407,7 +431,21 @@ def main(argv=None):
             from claude_swap import menubar
             from claude_swap.switcher import ClaudeAccountSwitcher
             icon = resources() / "goblin.png"
-            menubar.run(ClaudeAccountSwitcher(), extension=MenuExtension(), app_name="Patch Goblins", icon=icon if icon.is_file() else None)
+            if options.native_smoke:
+                smoke_home = os.environ.get("PATCH_GOBLINS_SMOKE_HOME")
+                smoke_data = os.environ.get("PATCH_GOBLINS_DATA")
+                if not smoke_home or not smoke_data or Path(smoke_home).resolve() != Path.home().resolve() or not Path(smoke_data).resolve().is_relative_to(Path(smoke_home).resolve()):
+                    raise ClaudeSwitchError("Native smoke requires an explicitly isolated HOME and PATCH_GOBLINS_DATA.")
+                profile = Path(smoke_home) / "claude-smoke"
+                profile.mkdir(mode=0o700, exist_ok=True)
+                os.environ["CLAUDE_CONFIG_DIR"] = str(profile)
+                os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(profile)
+            extension = MenuExtension(native_smoke=options.native_smoke)
+            menubar.run(ClaudeAccountSwitcher(), extension=extension, app_name="Patch Goblins", icon=icon if icon.is_file() else None)
+            if options.native_smoke:
+                if not extension.smoke_passed:
+                    raise ClaudeSwitchError("Native menu/backend smoke did not obtain an account snapshot.")
+                print("Native menu bar, supervisor bridge and bundled credential engine: passed")
     except (ClaudeSwitchError, OSError) as exc:
         print(f"Patch Goblins: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

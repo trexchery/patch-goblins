@@ -39,6 +39,14 @@ def main(app: Path) -> None:
         assert json.loads(record.read_text())["exitCode"] == 7
         assert record.stat().st_mode & 0o077 == 0, "Worker metadata must be private"
         print("Frozen worker dispatch, stdin/stdout, durable exit status and permissions: passed")
+        env["PATCH_GOBLINS_SMOKE_HOME"] = str(root)
+        result = subprocess.run([executable, "--native-smoke"], env=env, text=True,
+                                capture_output=True, timeout=40)
+        marker = "Native menu bar, supervisor bridge and bundled credential engine: passed"
+        assert result.returncode == 0 and marker in result.stdout, (
+            result.returncode, result.stdout, result.stderr,
+        )
+        print(marker)
 
 
 if __name__ == "__main__":

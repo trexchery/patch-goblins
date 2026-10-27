@@ -419,7 +419,9 @@ public sealed partial class Supervisor : IDisposable
             Notify?.Invoke("Agents waiting for usage", "Every Claude account is near its limit" + (back is { } t ? $"; they continue by themselves {Format.When(t, DateTimeOffset.Now)}." : "."));
         }
         else if (!allOut && _allOut && (started || _workers.Count > 0)) Notify?.Invoke("Agents resumed", "A Claude account has usage again.");
-        _allOut = allOut;
+        // Account refresh and baseline checks can interleave a pass with no
+        // dispatch. Keep the notification pending until work actually resumes.
+        _allOut = allOut || (_allOut && !started && _workers.Count == 0);
         _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold, _solo) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
     }
 
