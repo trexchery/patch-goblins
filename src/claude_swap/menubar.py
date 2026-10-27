@@ -592,6 +592,8 @@ def run(switcher, *, extension=None, app_name="claude-swap", icon=None) -> int:
             self.refresh_async()  # first display fetch
             if self.settings.auto_switch_enabled:
                 self._start_engine()
+            if extension is not None:
+                extension.auto_switch_changed(self.settings.auto_switch_enabled)
 
         # ---- display refresh plumbing ----------------------------------------
         def refresh_async(self, full=False):
@@ -1049,6 +1051,8 @@ def run(switcher, *, extension=None, app_name="claude-swap", icon=None) -> int:
                 self._start_engine()
             else:
                 self._stop_engine()
+            if extension is not None:
+                extension.auto_switch_changed(self.settings.auto_switch_enabled)
             self.rebuild_menu()
 
         def _make_threshold(self, pct):

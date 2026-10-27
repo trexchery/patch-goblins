@@ -31,7 +31,9 @@ for size in 16 32 128 256 512; do
     sips -z "$double" "$double" assets/goblin.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$BUILD/goblin.icns"
-"$PY" macos/setup.py py2app --bdist-base "$BUILD/py2app" --dist-dir "$BUILD/dist"
+# Keep py2app separate from the source package's PEP 621 metadata: py2app
+# rejects install_requires, which setuptools imports from a root pyproject.
+(cd "$ROOT/macos" && "$PY" setup.py py2app --bdist-base "$BUILD/py2app" --dist-dir "$BUILD/dist")
 APP="$BUILD/dist/Patch Goblins.app"
 # py2app sets the name from the script, so normalize the bundle and launcher.
 if [[ ! -d "$APP" && -d "$BUILD/dist/main.app" ]]; then

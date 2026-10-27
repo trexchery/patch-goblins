@@ -131,7 +131,7 @@ class GoblinsApp(App):
                 process.terminate()
                 await process.wait()
                 raise ClaudeSwitchError("The request timed out. Open Patch Goblins from Applications and check pending approvals.") from None
-            output.write("> " + text)
+            output.write("> " + tool)
             result = stdout.decode("utf-8", errors="replace").strip()
             error = stderr.decode("utf-8", errors="replace").strip()
             output.write(result or error or ("Done." if process.returncode == 0 else "Start Patch Goblins from Applications first."))

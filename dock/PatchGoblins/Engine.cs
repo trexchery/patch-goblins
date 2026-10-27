@@ -23,6 +23,15 @@ public sealed partial class Engine(string exe)
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
         var bundled = Path.Combine(AppContext.BaseDirectory, "engine", OperatingSystem.IsWindows() ? "cswap.exe" : "cswap");
         if (File.Exists(bundled)) return new Engine(bundled);
+        if (!OperatingSystem.IsWindows())
+        {
+            var appEngine = new[]
+            {
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "MacOS", "cswap")),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "engine", "cswap")),
+            }.FirstOrDefault(File.Exists);
+            if (appEngine != null) return new Engine(appEngine);
+        }
         // No PATH fallback: an upstream claude-swap there lacks DPAPI sealing and providers.
         throw new EngineException(
             "Engine not found. Expected engine\\cswap.exe next to patch-goblins.exe; " +

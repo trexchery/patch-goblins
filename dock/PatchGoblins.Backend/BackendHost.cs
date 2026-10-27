@@ -15,11 +15,14 @@ internal sealed class BackendHost
     Supervisor supervisor = null!;
     bool refreshing;
     Snapshot? accounts;
+    BackendUpkeep upkeep = null!;
 
     public async Task RunAsync()
     {
         var cli = Cli.Locate() ?? throw new EngineException("Git is required. Install Git and the GitHub CLI, then restart Patch Goblins.");
         supervisor = new Supervisor(engine, cli, new AgentStore(AgentStore.DefaultRoot), new AgentsConfig());
+        upkeep = new BackendUpkeep(engine, settings, () => accounts,
+            (title, body) => Write(new { @event = "notify", title, body }), async () => { await RefreshAsync(); });
         ApplySettings();
         supervisor.Authorize = (repo, verify, branch) => AskAsync($"Start agents on {repo.Leaf}?",
             $"Repository: {repo.Path}\nBase: {branch}\nVerification: {verify ?? "No verification command; relies on CI."}\n\n" +
@@ -42,11 +45,16 @@ internal sealed class BackendHost
         supervisor.Start();
         Write(new { @event = "ready", schemaVersion = 1 });
         var poll = PollAsync();
+        var maintenance = MaintainAsync();
+        // Console.In is a synchronized TextReader whose async methods may block
+        // synchronously. Read the actual pipe so Supervisor continuations and
+        // native approval responses keep running while stdin is idle.
+        using var input = new StreamReader(Console.OpenStandardInput(), new System.Text.UTF8Encoding(false));
         try
         {
             while (!stopping.IsCancellationRequested)
             {
-                var line = await Console.In.ReadLineAsync(stopping.Token);
+                var line = await input.ReadLineAsync(stopping.Token);
                 if (line == null) break;
                 // A call may await a native approval; continue reading its answer.
                 requests.RemoveAll(t => t.IsCompleted);
@@ -60,7 +68,9 @@ internal sealed class BackendHost
             foreach (var answer in approvals.Values) answer.TrySetResult(false);
             await supervisor.StopAllAsync();
             supervisor.Dispose();
+            upkeep.Dispose();
             try { await poll; } catch (OperationCanceledException) { }
+            try { await maintenance; } catch (OperationCanceledException) { }
         }
     }
 
@@ -148,6 +158,9 @@ internal sealed class BackendHost
                 case "askApproval": settings.AskApproval = property.Value.GetBoolean(); break;
                 case "preserveRemoteControl": settings.PreserveRemoteControl = property.Value.GetBoolean(); break;
                 case "quotaNotifications": settings.QuotaNotifications = property.Value.GetBoolean(); break;
+                case "autoSwitch": settings.AutoSwitch = property.Value.GetBoolean(); break;
+                case "autoPrime": settings.AutoPrime = property.Value.GetBoolean(); break;
+                case "autoLine": settings.AutoLine = property.Value.GetBoolean(); break;
                 case "refreshSeconds": settings.RefreshSeconds = Math.Clamp(property.Value.GetInt32(), 60, 3600); break;
                 default: throw new EngineException("Unsupported desktop setting: " + property.Name);
             }
@@ -206,6 +219,16 @@ internal sealed class BackendHost
         {
             await RefreshAsync();
             await Task.Delay(TimeSpan.FromSeconds(settings.RefreshSeconds), stopping.Token);
+        }
+    }
+
+    async Task MaintainAsync()
+    {
+        while (!stopping.IsCancellationRequested)
+        {
+            try { await upkeep.TickAsync(supervisor); }
+            catch (Exception e) { Program.Log(e); }
+            await Task.Delay(TimeSpan.FromSeconds(3), stopping.Token);
         }
     }
 

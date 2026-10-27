@@ -47,6 +47,8 @@ Patch Goblins is built on claude-swap's credential and quota engine. Both are lo
 
 ## Quick start
 
+**Apple Silicon macOS:** see [installation, native menu bar, and verification](docs/macos.md). From a source checkout, `bash macos/install.sh` builds and installs the app. Development downloads are attached to the [macOS workflow](https://github.com/trexchery/patch-goblins/actions/workflows/macos.yml) after its packaging job succeeds.
+
 > Needs Windows 11 x64, [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Git for Windows](https://git-scm.com/download/win) and the [GitHub CLI](https://cli.github.com/) (`gh auth login`).
 
 1. **Download** `patch-goblins-win-x64.zip` from the [latest release](https://github.com/trexchery/patch-goblins/releases/latest), extract it, and run `patch-goblins.exe`.

@@ -39,7 +39,7 @@ switch ("$($a[0]) $($a[1])") {
         exit 0
     }
     'pr create' {
-        $list = Prs
+        $list = @(Prs)
         $n = 7 + $list.Count
         $url = "https://github.com/owner/repo/pull/$n"
         $list += [pscustomobject]@{ number = $n; url = $url; head = (Arg '--head'); base = (Arg '--base'); title = (Arg '--title'); state = 'OPEN' }

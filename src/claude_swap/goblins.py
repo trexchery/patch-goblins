@@ -36,7 +36,9 @@ def backend_command() -> list[str]:
         return [override]
     root = resources()
     names = [root / "backend" / "patch-goblins-backend",
-             root / "dock" / "PatchGoblins.Backend" / "bin" / "Release" / "net8.0" / "patch-goblins-backend"]
+             root / "build" / "macos" / "backend" / "patch-goblins-backend",
+             root / "dock" / "PatchGoblins.Backend" / "bin" / "Release" / "net8.0" / "patch-goblins-backend",
+             root / "dock" / "PatchGoblins.Backend" / "bin" / "Debug" / "net8.0" / "patch-goblins-backend"]
     for candidate in names:
         if candidate.is_file():
             return [str(candidate)]
@@ -166,7 +168,7 @@ def run_terminal(argv: list[str], *, repo: str | None = None) -> Path:
     if repo:
         lines.append("cd -- " + shlex.quote(str(Path(repo).expanduser().resolve())))
     env = child_environment()
-    for key in ("PATH", "PATCH_GOBLINS_ENGINE", "PATCH_GOBLINS_ENGINE_ARGS", "PATCH_GOBLINS_PYTHON", "PATCH_GOBLINS_PYTHON_ARGS", "PATCH_GOBLINS_DATA"):
+    for key in ("PATH", "PATCH_GOBLINS_BACKEND", "PATCH_GOBLINS_ENGINE", "PATCH_GOBLINS_ENGINE_ARGS", "PATCH_GOBLINS_PYTHON", "PATCH_GOBLINS_PYTHON_ARGS", "PATCH_GOBLINS_DATA"):
         if key in env:
             lines.append("export " + key + "=" + shlex.quote(env[key]))
     lines.append("exec " + shlex.join(argv))
@@ -285,6 +287,9 @@ class MenuExtension:
         self._stopped = False
         self._refreshing = False
         self._refresh()
+
+    def auto_switch_changed(self, enabled):
+        self._background(lambda: self.client.request("settings", {"values": {"autoSwitch": bool(enabled)}}))
 
     def _choose_repo(self):
         import AppKit
