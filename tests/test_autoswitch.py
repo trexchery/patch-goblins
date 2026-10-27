@@ -1979,6 +1979,45 @@ class TestFreshening:
         mock_refresh.assert_not_called()
         assert h.active_number() == 2
 
+    def test_macos_skips_a_live_session_target(self, temp_home):
+        # macOS cannot keep the default login and the window's login in step,
+        # so auto never moves onto an account a `cswap run` window holds: it
+        # takes the next candidate (the pre-follow behaviour).
+        h = EngineHarness(temp_home)
+        h.switcher.platform = Platform.MACOS
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        with patch.object(
+            h.switcher, "live_session_pids_for", side_effect=lambda n, e: [4242] if n == "2" else []
+        ):
+            outcome = h.tick_with_usage(
+                {"1": _usage(95), "2": _usage(10), "3": _usage(40)}
+            )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_macos_with_only_a_live_session_target_stays_put(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.switcher.platform = Platform.MACOS
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_follow_logins_is_alone_on_macos_and_follows_elsewhere(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.switcher.platform = Platform.MACOS
+        assert not h.switcher.follows_logins()
+        assert h.switcher.follow_logins() == {"status": "alone"}
+        for p in (Platform.WINDOWS, Platform.LINUX, Platform.WSL):
+            h.switcher.platform = p
+            assert h.switcher.follows_logins()
+
     def test_live_session_profile_ahead_falls_to_the_next_candidate(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

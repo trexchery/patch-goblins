@@ -65,6 +65,11 @@ The terminal keeps the goblin theme, session commands, status line, and mascot p
 - Workers run as the signed-in user. These controls prevent mistakes and preserve the existing trust model; they are not an operating-system sandbox against arbitrary hostile code. No new privilege boundary is claimed.
 - Logs and owner-facing diagnostics use the shared secret redactor. Synthetic credentials and mocked GitHub responses are used in tests.
 
+## Known gaps against the Windows tray
+
+- Windows moves a window in a shell at its limit, and moves onto an account a `cswap run` window holds, then keeps the two logins in step (`follow_logins`). macOS does neither: the profile's login lives in a keychain entry only `claude` writes, so the backend's switch stays `--exclusive` and auto-switch skips a held account.
+- The backend's upkeep (`BackendUpkeep`) has no `Movable` or shell-at-limit moves and does not open the replacement window before closing the old one; that wiring exists only in the Windows `TrayApp`.
+
 ## Build and verification
 
 The reproducible build entry point is:

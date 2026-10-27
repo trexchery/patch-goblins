@@ -779,7 +779,7 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick). Only ever
+        trouble — try again next tick) or ``"skip-live-session"`` (macOS only). Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -787,7 +787,12 @@ class AutoSwitchEngine:
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
-            # profile. A window at its limit has to move off its account, so
+            # profile. On macOS the two logins cannot be kept in step
+            # (`follows_logins`), so auto skips it: one rotating refresh token
+            # in two places, nobody reading a warning.
+            if not self.switcher.follows_logins():
+                return "skip-live-session"
+            # Elsewhere a window at its limit has to move off its account, so
             # auto switches here like a manual switch does (warn and proceed);
             # the backup is not refreshed, because that would consume the
             # grant the session holds. `switch_to` still refuses when the
@@ -1378,6 +1383,8 @@ class AutoSwitchEngine:
                     status
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
+                continue
+            if status == "skip-live-session":
                 continue
             try:
                 return self._perform(
