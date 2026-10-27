@@ -433,12 +433,15 @@ public sealed class DashboardForm : Form
         return card;
     }
 
+    /// Tests pin the screen height the flyout may fill: a small CI display would otherwise cap it and hide growth.
+    internal int? WorkAreaHeight;
+
     /// Grows/shrinks with content, keeping the edge nearest the taskbar fixed.
     void FitHeight()
     {
         var content = _settings?.ContentHeight ?? _list.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical) + _list.Padding.Vertical;
-        var screen = Screen.FromPoint(Visible ? Location : Cursor.Position).WorkingArea;
-        var h = Math.Min(_header.Height + (_settings == null ? _footer.Height : 0) + content + Padding.Vertical, (int)(screen.Height * 0.8));
+        var screenHeight = WorkAreaHeight ?? Screen.FromPoint(Visible ? Location : Cursor.Position).WorkingArea.Height;
+        var h = Math.Min(_header.Height + (_settings == null ? _footer.Height : 0) + content + Padding.Vertical, (int)(screenHeight * 0.8));
         if (h == Height) return;
         var bottom = Bottom;
         Height = h;
