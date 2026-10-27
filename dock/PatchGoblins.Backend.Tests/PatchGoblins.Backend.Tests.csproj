@@ -11,6 +11,7 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
     <ProjectReference Include="../PatchGoblins.Backend/PatchGoblins.Backend.csproj" />
     <Compile Include="../PatchGoblins.Tests/RoutingTests.cs" Link="RoutingTests.cs" />
+    <Compile Include="../PatchGoblins.Tests/GuardFlavorTests.cs" Link="GuardFlavorTests.cs" />
     <Compile Include="../PatchGoblins.Tests/StallTests.cs" Link="StallTests.cs" />
     <Compile Include="../PatchGoblins.Tests/SwitchLineTests.cs" Link="SwitchLineTests.cs" />
     <Compile Include="../PatchGoblins.Tests/AgentsEndToEndTests.cs" Link="AgentsEndToEndTests.cs" />

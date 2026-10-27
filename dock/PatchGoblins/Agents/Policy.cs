@@ -142,26 +142,50 @@ public static class Policy
     public static bool SkipsCi(string commitMessages) => SkipCi.IsMatch(commitMessages);
 
     /// gitignore-style: `**` spans folders, `*` and `?` stay within one, a pattern without `/` matches at any depth.
-    /// Case-insensitive, as Windows paths are.
-    public static bool Glob(string pattern, string path)
+    /// Case-insensitive, as Windows paths are. `posix`: a POSIX path, matched exactly, a backslash an ordinary character
+    /// and a leading `/` the filesystem root.
+    public static bool Glob(string pattern, string path, bool posix = false)
     {
-        path = path.Replace('\\', '/');
-        var p = pattern.Replace('\\', '/').TrimStart('/');
+        if (!posix) (path, pattern) = (path.Replace('\\', '/'), pattern.Replace('\\', '/'));
+        var p = posix && path.StartsWith('/') ? pattern : pattern.TrimStart('/');
         var rx = Regex.Escape(p).Replace(@"\*\*/", "(.*/)?").Replace(@"\*\*", ".*").Replace(@"\*", "[^/]*").Replace(@"\?", "[^/]");
-        return Regex.IsMatch(path, (p.Contains('/') ? "^" : "^(.*/)?") + rx + "$", RegexOptions.IgnoreCase);
+        return Regex.IsMatch(path, (p.Contains('/') ? "^" : "^(.*/)?") + rx + "$", posix ? RegexOptions.None : RegexOptions.IgnoreCase);
+    }
+
+    /// Policy paths follow the operating system the agents run on: Windows paths compare ignoring case, POSIX ones are
+    /// absolute from `/` and compare exactly. The `posix` parameters below let a test exercise either rule set anywhere.
+    static readonly bool IsPosix = !OperatingSystem.IsWindows();
+
+    /// `path` made absolute against `from` with `.` and `..` resolved, no symbolic link followed. POSIX is resolved by hand
+    /// so it works on any host; a relative `from` is taken from the root, which only refuses more.
+    internal static string Full(string path, string from, bool posix)
+    {
+        if (!posix) return Path.GetFullPath(path, from);
+        List<string> parts = [];
+        foreach (var part in (path.StartsWith('/') ? path : from + "/" + path).Split('/'))
+            if (part == "..") { if (parts.Count > 0) parts.RemoveAt(parts.Count - 1); }
+            else if (part is not ("" or ".")) parts.Add(part);
+        return "/" + string.Join('/', parts);
     }
 
     /// `dir` is `path` or one of its folders.
-    public static bool Covers(string dir, string path)
+    public static bool Covers(string dir, string path) => Covers(dir, path, IsPosix);
+
+    internal static bool Covers(string dir, string path, bool posix)
     {
+        if (posix)
+        {
+            var (a, b) = (Full(dir, "/", true).TrimEnd('/'), Full(path, "/", true).TrimEnd('/'));
+            return b == a || b.StartsWith(a + "/", StringComparison.Ordinal);
+        }
         var (d, p) = (Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)), Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)));
         return p.Equals(d, StringComparison.OrdinalIgnoreCase) || p.StartsWith(d + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     static readonly Regex PathRule = new(@"^(Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep)\((.+)\)$");
 
-    /// Claude Code's absolute path rule form: `C:\a b` is `//c/a b`.
-    static string Rule(string path) => "//" + char.ToLowerInvariant(path[0]) + path[2..].Replace('\\', '/');
+    /// Claude Code's absolute path rule form (`//` is the filesystem root): `C:\a b` is `//c/a b`, `/Users/x` is `//Users/x`.
+    internal static string Rule(string path, bool posix) => posix ? "/" + path : "//" + char.ToLowerInvariant(path[0]) + path[2..].Replace('\\', '/');
 
     /// The deny rules a worker in `worktree` gets. Claude Code matches path rules gitignore-style, and a folder that
     /// matches takes everything below it: `Read(~/AppData/Local/patch-goblins/agents/*)` matches `agents\wt`, so it denies
@@ -171,6 +195,9 @@ public static class Policy
     /// worker's own Claude Code settings in its worktree are never its to edit: its next run would load them.
     public static List<string> Confine(IEnumerable<string> deny, string worktree, string home, List<string> notes)
     {
+        var posix = IsPosix;
+        string Slash(string p) => posix ? p : p.Replace('\\', '/');
+        string Rule(string p) => Policy.Rule(p, posix);
         worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath(worktree));
         var chain = new List<string>();
         for (var d = worktree; d != null; d = Path.GetDirectoryName(d)) chain.Insert(0, d);
@@ -179,14 +206,15 @@ public static class Policy
         {
             if (PathRule.Match(rule) is not { Success: true } m) { rules.Add(rule); continue; }
             var (tool, pattern) = (m.Groups[1].Value, m.Groups[2].Value);
-            // `~/` is the user folder and `//c/` a drive; anything else is relative to the worktree.
-            var abs = pattern.StartsWith("~/") ? home.Replace('\\', '/') + pattern[1..]
+            // `~/` is the user folder and `//c/` a drive (`//` the root on POSIX); anything else is relative to the worktree.
+            var abs = pattern.StartsWith("~/") ? Slash(home) + pattern[1..]
+                : posix ? pattern.StartsWith("//") ? pattern[1..] : null
                 : Regex.IsMatch(pattern, "^//[A-Za-z]/") ? pattern[2] + ":" + pattern[3..] : null;
-            string[] own = abs == null ? ["probe", "probe/probe"] : [worktree.Replace('\\', '/') + "/probe", worktree.Replace('\\', '/') + "/probe/probe"];
-            var at = abs == null ? -1 : chain.FindIndex(a => Glob(abs, a.Replace('\\', '/')));
-            if (at < 0 && !own.Any(o => Glob(abs ?? Regex.Replace(pattern, @"^\./", ""), o))) { rules.Add(rule); continue; }
+            string[] own = abs == null ? ["probe", "probe/probe"] : [Slash(worktree) + "/probe", Slash(worktree) + "/probe/probe"];
+            var at = abs == null ? -1 : chain.FindIndex(a => Glob(abs, Slash(a), posix));
+            if (at < 0 && !own.Any(o => Glob(abs ?? Regex.Replace(pattern, @"^\./", ""), o, posix))) { rules.Add(rule); continue; }
             List<string> narrowed = [];
-            if (at > 0) narrowed.AddRange(Entries(chain[at - 1]).Where(e => !Same(e, chain[at]) && Glob(abs!, e.Replace('\\', '/'))));
+            if (at > 0) narrowed.AddRange(Entries(chain[at - 1]).Where(e => !Same(e, chain[at]) && Glob(abs!, Slash(e), posix)));
             for (var j = at + 1; at >= 0 && j < chain.Count; j++) narrowed.AddRange(Entries(chain[j - 1]).Where(e => !Same(e, chain[j])));
             // ponytail: a rule high up (`~/**`) would list hundreds of folders and overrun the command line: dropped instead
             if (at < 0 || narrowed.Count > 100) { notes.Add($"{rule} would deny the worker its own worktree; not applied"); continue; }
@@ -196,7 +224,7 @@ public static class Policy
         rules.AddRange(new[] { "settings.json", "settings.local.json" }.Select(f => $"Edit({Rule(Path.Combine(worktree, ".claude", f))})"));
         return rules;
 
-        static bool Same(string a, string b) => string.Equals(Path.TrimEndingDirectorySeparator(a), b, StringComparison.OrdinalIgnoreCase);
+        bool Same(string a, string b) => string.Equals(Path.TrimEndingDirectorySeparator(a), b, posix ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
         static IEnumerable<string> Entries(string dir)
         {
             try { return Directory.GetFileSystemEntries(dir); }
@@ -212,36 +240,38 @@ public static class Policy
     /// mode alone lets a worker read and write anywhere the owner's Windows user can, and Claude Code's path rules cannot
     /// say "only here". Exit code 2 makes Claude Code refuse the call and tell the worker why; a call it cannot read is
     /// refused too. Bash is not parsed: the owner's deny rules and auto mode's classifier cover it.
-    public static int Guard(string[] roots, string input, TextWriter why)
+    public static int Guard(string[] roots, string input, TextWriter why) => Guard(roots, input, why, IsPosix);
+
+    internal static int Guard(string[] roots, string input, TextWriter why, bool posix)
     {
         List<string> targets;
-        try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)); }
+        try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), posix); }
         catch (Exception e) when (e is JsonException or InvalidOperationException or ArgumentException or KeyNotFoundException or NotSupportedException or IndexOutOfRangeException)
         {
             why.WriteLine("Patch Goblins could not read this tool call, so it is refused.");
             return 2;
         }
-        if (targets.FirstOrDefault(t => !roots.Any(r => Covers(r, t))) is not { } outside) return 0;
+        if (targets.FirstOrDefault(t => !roots.Any(r => Covers(r, t, posix))) is not { } outside) return 0;
         why.WriteLine($"{outside} is outside this agent's worktree and the folders its owner approved. Work inside the worktree; " +
             "if the task truly needs that folder, ask the owner, who can add it to the repository's local policy as addDirs.");
         return 2;
     }
 
     /// The paths a file tool call reaches, resolved as Claude Code does: against the session's folder, `~` as the user folder.
-    internal static List<string> Targets(string input, string fallback, string home)
+    internal static List<string> Targets(string input, string fallback, string home, bool posix)
     {
         var call = JsonDocument.Parse(input).RootElement;
         var cwd = call.TryGetProperty("cwd", out var c) && c.GetString() is { Length: > 0 } s ? s : fallback;
         var args = call.GetProperty("tool_input");
-        string Full(string p, string from) => Path.GetFullPath(p == "~" || p.StartsWith("~/") || p.StartsWith("~\\") ? home + p[1..] : p, from);
+        string Full(string p, string from) => Policy.Full(p == "~" || p.StartsWith("~/") || !posix && p.StartsWith("~\\") ? home + p[1..] : p, from, posix);
         List<string> targets = [];
         foreach (var key in new[] { "file_path", "notebook_path", "path" })
             if (args.TryGetProperty(key, out var v) && v.GetString() is { Length: > 0 } p) targets.Add(Full(p, cwd));
         // A Glob pattern can climb out on its own (`../../**`, `C:/Users/**`): its folders up to the first wildcard.
         if (call.GetProperty("tool_name").GetString() == "Glob" && args.TryGetProperty("pattern", out var g) && g.GetString() is { } pattern)
         {
-            var fixedPart = string.Join('/', pattern.Replace('\\', '/').Split('/').TakeWhile(x => x.IndexOfAny(['*', '?', '[', '{']) < 0));
-            targets.Add(Full(fixedPart.Length > 0 ? fixedPart : ".", targets.FirstOrDefault() ?? cwd));
+            var fixedPart = string.Join('/', (posix ? pattern : pattern.Replace('\\', '/')).Split('/').TakeWhile(x => x.IndexOfAny(['*', '?', '[', '{']) < 0));
+            targets.Add(Full(fixedPart.Length > 0 ? fixedPart : posix && pattern.StartsWith('/') ? "/" : ".", targets.FirstOrDefault() ?? cwd));
         }
         return targets;
     }

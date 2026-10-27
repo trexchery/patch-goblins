@@ -17,6 +17,12 @@ internal static class Program
         }
         if (args is ["--version"]) { Console.WriteLine("Patch Goblins 0.7.0"); return 0; }
         if (args is ["agents-mcp", ..]) return AgentsLink.ServeMcp(args);
+        // A worker's PreToolUse hook, as on Windows: 0 lets the file tool call run, 2 refuses it with the reason on stderr.
+        if (args is ["guard", _, ..])
+        {
+            using var why = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
+            return Policy.Guard(args[1..], new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false)).ReadToEnd(), why);
+        }
         if (args is ["doctor", ..]) return Doctor.Run(args);
         if (args is ["call", var tool, var json, "--repo", var repo])
         {
