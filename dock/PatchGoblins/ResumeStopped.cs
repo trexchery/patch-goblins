@@ -12,13 +12,19 @@ namespace PatchGoblins;
 /// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
-    string? Model = null)
+    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null)
 {
     public bool Idle => Status == "idle";
+    /// A workflow run is still going in the window's project folder: the window looks idle, but closing it would end the run.
+    public bool Running => Runs is { Count: > 0 };
     /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
-    /// so the background command runs on to its end (the reopened window is told).
-    public bool Movable => Idle || AtLimit && Status == "shell";
+    /// so the background command runs on to its end (the reopened window is told). Never while a workflow runs.
+    public bool Movable => (Idle || AtLimit && Status == "shell") && !Running;
 }
+
+/// A Claude Code workflow run that has not settled (`RunId` "wf_..." under session `SessionId`). `Hidden`: started from a hidden
+/// script, which a new process cannot resume. `InFlight`: agent keys started without a result; `Parked`: those whose agent sits at a 429.
+public sealed record WorkflowRun(string SessionId, string RunId, bool Hidden, IReadOnlyList<string> InFlight, IReadOnlyList<string> Parked);
 
 /// A usage-limit stop as Claude Code recorded it: the window that ran out ("five_hour", "seven_day", ...), when it
 /// resets, and when the stop happened. Default fields: an older error without the details.
@@ -194,14 +200,79 @@ public static class ResumeStopped
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail)));
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail),
+                            RunningWorkflows(Path.GetDirectoryName(t)!, started)));
                     else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail)));
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail),
+                            Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started)));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
         }
         return found;
+    }
+
+    /// The workflow runs still going in a project folder (`projects/<cwd>`), as of a window started at `sinceUtc`. Every session
+    /// folder is looked at: after /clear or a fork a background run keeps writing under the old session id. A run counts when its
+    /// journal was written since the window started (a run of a dead process is older) and it has no settlement snapshot
+    /// (`<sid>/workflows/<run>.json`, written only as it settles). Task outputs (`w*.output`) are not used: they name no run.
+    public static List<WorkflowRun> RunningWorkflows(string projectDir, DateTime sinceUtc)
+    {
+        var runs = new List<WorkflowRun>();
+        try
+        {
+            foreach (var session in Directory.EnumerateDirectories(projectDir))
+            {
+                var root = Path.Combine(session, "subagents", "workflows");
+                if (!Directory.Exists(root)) continue;
+                var sid = Path.GetFileName(session);
+                foreach (var run in Directory.EnumerateDirectories(root, "wf_*"))
+                {
+                    var journal = Path.Combine(run, "journal.jsonl");
+                    if (!File.Exists(journal)) continue;
+                    var wrote = File.GetLastWriteTimeUtc(journal);
+                    var id = Path.GetFileName(run);
+                    if (wrote <= sinceUtc || File.Exists(Path.Combine(session, "workflows", id + ".json"))) continue;
+                    var hidden = false;
+                    // A resume appends to this journal: a killed agent's key is started again (new agent id). A key is done at its first result or failure.
+                    var open = new Dictionary<string, string>(); // started key -> latest agent id
+                    var done = new HashSet<string>();
+                    using (var reader = new StreamReader(new FileStream(journal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)))
+                        for (var line = reader.ReadLine(); line != null; line = reader.ReadLine())
+                            try
+                            {
+                                using var doc = JsonDocument.Parse(line);
+                                var r = doc.RootElement;
+                                switch (Str(r, "type"))
+                                {
+                                    case "launched": hidden |= r.TryGetProperty("hiddenScriptSha256", out var h) && h.ValueKind == JsonValueKind.String; break;
+                                    case "started" when Str(r, "key") is { } k && !done.Contains(k): open[k] = Str(r, "agentId") ?? ""; break;
+                                    case "result" or "failed" when Str(r, "key") is { } k: done.Add(k); open.Remove(k); break;
+                                }
+                            }
+                            catch (JsonException) { } // a line being written
+                    runs.Add(new WorkflowRun(sid, id, hidden, [.. open.Keys],
+                        [.. open.Where(a => a.Value.Length > 0 && Parked(Path.Combine(run, $"agent-{a.Value}.jsonl"))).Select(a => a.Key)]));
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return runs;
+    }
+
+    /// Whether a workflow agent's file ends at Claude Code's own 429: parked at a usage limit until it resets.
+    static bool Parked(string agentFile)
+    {
+        try
+        {
+            if (Tail(agentFile, 64 * 1024).LastOrDefault() is not { } last) return false;
+            using var doc = JsonDocument.Parse(last);
+            var r = doc.RootElement;
+            return Str(r, "type") == "assistant" && r.TryGetProperty("isApiErrorMessage", out var e) && e.ValueKind == JsonValueKind.True
+                && r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "model") == "<synthetic>"
+                && (Str(r, "error") == "rate_limit" || r.TryGetProperty("apiErrorStatus", out var st) && st.ValueKind == JsonValueKind.Number && st.GetInt32() == 429);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or FormatException) { return false; }
     }
 
     /// Whether the conversation's last message is Claude Code's own usage-limit error.
@@ -397,19 +468,19 @@ public static class ResumeStopped
     /// `Scan`), and no wrapper runs without a window (`runs` above `records`: a headless run, an agent). One busy, shell,
     /// waiting or unread window keeps the whole profile, so nothing working is closed and the account is never half freed.
     public static bool Releasable(IReadOnlyCollection<StoppedSession> windows, int records, int runs) =>
-        records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle);
+        records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle && !w.Running);
 
     /// Whether only agent runs keep a profile from being `Releasable`: every window in it idle, and each run without a window
     /// (`runs` above `records`) one of the `agentRuns` the agents have on that account, so they can yield it.
     public static bool AgentsOnly(IReadOnlyCollection<StoppedSession> windows, int records, int runs, int agentRuns) =>
-        windows.Count == records && windows.All(w => w.Idle) && runs > records && agentRuns >= runs - records;
+        windows.Count == records && windows.All(w => w.Idle && !w.Running) && runs > records && agentRuns >= runs - records;
 
     /// What keeps a profile that is not `Releasable`, for the user: each window not idle by folder and status, a window the
     /// scan did not see as done, a run without a window (an agent's, or a headless `cswap run`).
     public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
     {
-        var held = windows.Where(w => !w.Idle).Select(w => w.Status == "agents" ? $"the agents terminal in {Path.GetFileName(w.Cwd.TrimEnd('\\'))}"
-            : $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
+        var held = windows.Where(w => !w.Idle || w.Running).Select(w => w.Status == "agents" ? $"the agents terminal in {Path.GetFileName(w.Cwd.TrimEnd('\\'))}"
+            : $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({(w.Running ? "workflow running" : w.Status)})").ToList();
         if (records > windows.Count) held.Add(records - windows.Count == 1 ? "a window still working" : $"{records - windows.Count} windows still working");
         if (runs > records) held.Add(runs - records == 1 ? "an agent or headless run" : $"{runs - records} agent or headless runs");
         return held;
@@ -520,6 +591,8 @@ public static class ResumeStopped
     /// A finished turn moves only off the default login, and only after a minute without input anywhere.
     public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged)
     {
+        // A workflow still running in the window would die with it: never moved; at a limit, the owner is told it stays.
+        if (s.Running) return s.AtLimit ? Step.Left : Step.Ignore;
         if (!s.Movable) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
         if (!s.AtLimit && (s.ConfigDir == DefaultDir || userIdle < TimeSpan.FromSeconds(60))) return Step.Ignore;
         if (s.AtLimit && userIdle < typingPause) return Step.Wait;

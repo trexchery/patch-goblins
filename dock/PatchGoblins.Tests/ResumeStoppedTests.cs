@@ -573,6 +573,132 @@ public class ResumeStoppedTests
         Assert.True(ResumeStopped.PosixLive("12345", At(started), true, () => "12345", other, kill: false));
         Assert.False(ResumeStopped.PosixLive("12345", At(started), true, () => "99999", claude, kill: false));
     }
+
+    const string Parked429 = """{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your limit"}]}}""";
+
+    /// A synthetic workflow run under `project/<sid>/subagents/workflows/<run>`: agent `a1` (key k1) done, `a2` (k2) in flight, parked at a 429.
+    static string StageRun(string project, string sid, string run, bool hidden = false)
+    {
+        var dir = Path.Combine(project, sid, "subagents", "workflows", run);
+        Directory.CreateDirectory(dir);
+        File.WriteAllLines(Path.Combine(dir, "journal.jsonl"), [
+            hidden ? """{"type":"launched","hiddenScriptSha256":"abc"}""" : """{"type":"launched"}""",
+            """{"type":"started","key":"k1","agentId":"a1","label":"one","phase":"P"}""",
+            """{"type":"started","key":"k2","agentId":"a2","label":"two","phase":"P"}""",
+            """{"type":"result","key":"k1","agentId":"a1","result":{"ok":true}}""",
+        ]);
+        File.WriteAllLines(Path.Combine(dir, "agent-a2.jsonl"), [Done, Parked429]);
+        return Path.Combine(dir, "journal.jsonl");
+    }
+
+    static StoppedSession Window(bool atLimit, string root) =>
+        new(1, "sid", @"C:\w", Path.Combine(root, "profile"), 3, Path.Combine(root, "sid.jsonl"), atLimit,
+            Runs: [new WorkflowRun("sid", "wf_1", false, ["k2"], [])]);
+
+    [Fact]
+    public void AWindowRunningAWorkflowIsNeverMoved()
+    {
+        var root = Path.GetTempPath();
+        ResumeStopped.Step Of(StoppedSession s) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true);
+        Assert.Equal(ResumeStopped.Step.Move, Of(Window(false, root) with { Runs = null })); // the same window without the run moves
+        Assert.Equal(ResumeStopped.Step.Ignore, Of(Window(false, root)));
+        Assert.Equal(ResumeStopped.Step.Move, Of(Window(true, root) with { Runs = null }));
+        Assert.Equal(ResumeStopped.Step.Left, Of(Window(true, root))); // at its limit: reported, never closed
+        Assert.Equal(ResumeStopped.Step.Left, Of(Window(true, root) with { Status = "shell" }));
+        Assert.False(Window(false, root).Movable); // so `Unchanged`, the last look before any close, refuses it too
+        Assert.False(ResumeStopped.Releasable([Window(false, root)], 1, 1)); // and a free never closes it
+        Assert.Contains("w (workflow running)", ResumeStopped.Holders([Window(false, root)], 1, 1));
+    }
+
+    [Fact]
+    public void RunningWorkflowsAreFoundInEverySessionFolderUntilTheySettle()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var project = Path.Combine(root, "projects", "C--w");
+            var since = DateTime.UtcNow.AddMinutes(-5);
+            StageRun(project, "old-sid", "wf_a"); // a sibling session's folder: the run outlived a /clear
+            var run = Assert.Single(ResumeStopped.RunningWorkflows(project, since));
+            Assert.Equal(("old-sid", "wf_a", false), (run.SessionId, run.RunId, run.Hidden));
+            Assert.Equal(["k2"], run.InFlight);
+            Assert.Equal(["k2"], run.Parked);
+
+            Assert.Empty(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(5))); // written before the window started
+
+            StageRun(project, "sid", "wf_b", hidden: true);
+            Assert.True(Assert.Single(ResumeStopped.RunningWorkflows(project, since), r => r.RunId == "wf_b").Hidden); // cannot resume elsewhere, still running
+            Directory.CreateDirectory(Path.Combine(project, "sid", "workflows"));
+            File.WriteAllText(Path.Combine(project, "sid", "workflows", "wf_b.json"), """{"status":"completed"}""");
+            Assert.Equal("wf_a", Assert.Single(ResumeStopped.RunningWorkflows(project, since)).RunId); // wf_b settled: its snapshot exists
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// Two runs in one session: the one that settled writes its snapshot and its task output (`w*.output`, which names no run)
+    /// in the same seconds the other last wrote its journal. That output settles nothing: the other run is still going.
+    [Fact]
+    public void ASiblingRunSettlingNeverHidesOneStillRunning()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        var name = "C--pg-" + Guid.NewGuid().ToString("N");
+        var tasks = Path.Combine(Path.GetTempPath(), "claude", name, "sid", "tasks"); // where Claude Code writes them
+        try
+        {
+            var project = Path.Combine(root, "projects", name);
+            var running = StageRun(project, "sid", "wf_running");
+            StageRun(project, "sid", "wf_done");
+            Directory.CreateDirectory(Path.Combine(project, "sid", "workflows"));
+            File.WriteAllText(Path.Combine(project, "sid", "workflows", "wf_done.json"), """{"status":"completed"}""");
+            Directory.CreateDirectory(tasks);
+            File.WriteAllText(Path.Combine(tasks, "wdone.output"), "the sibling's result");
+            File.SetLastWriteTimeUtc(Path.Combine(tasks, "wdone.output"), File.GetLastWriteTimeUtc(running).AddSeconds(2));
+            var run = Assert.Single(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5)));
+            Assert.Equal("wf_running", run.RunId);
+            Assert.Equal(["k2"], run.InFlight);
+        }
+        finally { Directory.Delete(root, true); Directory.Delete(Path.GetDirectoryName(Path.GetDirectoryName(tasks))!, true); }
+    }
+
+    /// A resume appends to the same journal (no "resumed" line): an agent killed in flight gets a second "started" for its key,
+    /// then one "result". A key is settled once any result or failure exists for it, whatever comes after.
+    [Fact]
+    public void AResumedJournalCountsAKeyInFlightUntilItsFirstResult()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var project = Path.Combine(root, "projects", "C--w");
+            var journal = Path.Combine(project, "sid", "subagents", "workflows", "wf_r", "journal.jsonl");
+            Directory.CreateDirectory(Path.GetDirectoryName(journal)!);
+            string Line(string type, string key, string agent) => $$"""{"type":"{{type}}","key":"{{key}}","agentId":"{{agent}}"}""";
+            string[] InFlight(params string[] lines)
+            {
+                File.WriteAllLines(journal, ["""{"type":"launched"}""", .. lines]);
+                return [.. Assert.Single(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5))).InFlight];
+            }
+            string[] alphaDone = [Line("started", "alpha", "a1"), Line("result", "alpha", "a1"), Line("started", "beta", "b1")];
+            Assert.Empty(InFlight([.. alphaDone, Line("started", "beta", "b2"), Line("result", "beta", "b2")]));
+            Assert.Equal(["beta"], InFlight([.. alphaDone, Line("started", "beta", "b2")]));
+            Assert.Empty(InFlight([.. alphaDone, Line("failed", "beta", "b1"), Line("started", "beta", "b2")])); // settled at its failure
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void ScanAttachesTheRunsOfTheWindowsProject()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "idle", [Typed, Done]);
+            StageRun(Path.Combine(root, "projects", "C--w"), "other-sid", "wf_c");
+            var s = Assert.Single(ScanOf(root, 60));
+            Assert.Equal("wf_c", Assert.Single(s.Runs!).RunId);
+            Assert.Equal(ResumeStopped.Step.Ignore, ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true));
+        }
+        finally { Directory.Delete(root, true); }
+    }
 }
 
 /// Read-only scan of this machine's real Claude windows; set PATCH_GOBLINS_LIVE_SCAN=1. Passes trivially otherwise.
