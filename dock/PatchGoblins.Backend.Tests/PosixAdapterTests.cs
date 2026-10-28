@@ -19,7 +19,7 @@ public sealed class PosixAdapterTests
         var run = Path.Combine(project, "old-sid", "subagents", "workflows", "wf_a");
         Directory.CreateDirectory(run);
         File.WriteAllLines(Path.Combine(run, "journal.jsonl"), ["""{"type":"launched"}""", """{"type":"started","key":"k","agentId":"a","label":"x","phase":"P"}"""]);
-        var runs = ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5), Path.Combine(tmp.Path, "tmp"));
+        var runs = ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5));
         Assert.Equal(["k"], Assert.Single(runs).InFlight);
         var idle = new StoppedSession(1, "sid", "/w", Path.Combine(tmp.Path, "profile"), 3, Path.Combine(project, "sid.jsonl"), false, Runs: runs);
         ResumeStopped.Step Of(StoppedSession s) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true);

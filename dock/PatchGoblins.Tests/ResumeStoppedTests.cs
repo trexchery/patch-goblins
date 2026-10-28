@@ -617,32 +617,70 @@ public class ResumeStoppedTests
         try
         {
             var project = Path.Combine(root, "projects", "C--w");
-            var tasks = Path.Combine(root, "tmp");
             var since = DateTime.UtcNow.AddMinutes(-5);
-            var journal = StageRun(project, "old-sid", "wf_a"); // a sibling session's folder: the run outlived a /clear
-            var run = Assert.Single(ResumeStopped.RunningWorkflows(project, since, tasks));
+            StageRun(project, "old-sid", "wf_a"); // a sibling session's folder: the run outlived a /clear
+            var run = Assert.Single(ResumeStopped.RunningWorkflows(project, since));
             Assert.Equal(("old-sid", "wf_a", false), (run.SessionId, run.RunId, run.Hidden));
             Assert.Equal(["k2"], run.InFlight);
             Assert.Equal(["k2"], run.Parked);
 
-            Assert.Empty(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(5), tasks)); // written before the window started
-
-            var outputs = Path.Combine(tasks, "old-sid", "tasks");
-            Directory.CreateDirectory(outputs);
-            File.WriteAllText(Path.Combine(outputs, "wabc.output"), ""); // launched, not settled
-            Assert.Single(ResumeStopped.RunningWorkflows(project, since, tasks));
-            File.WriteAllText(Path.Combine(outputs, "wold.output"), "an earlier run's result");
-            File.SetLastWriteTimeUtc(Path.Combine(outputs, "wold.output"), File.GetLastWriteTimeUtc(journal).AddMinutes(-3));
-            Assert.Single(ResumeStopped.RunningWorkflows(project, since, tasks)); // an earlier run's output settles nothing
-            File.WriteAllText(Path.Combine(outputs, "wabc.output"), "the result");
-            File.SetLastWriteTimeUtc(Path.Combine(outputs, "wabc.output"), File.GetLastWriteTimeUtc(journal).AddSeconds(1));
-            Assert.Empty(ResumeStopped.RunningWorkflows(project, since, tasks)); // settled: its output written as it ended
+            Assert.Empty(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(5))); // written before the window started
 
             StageRun(project, "sid", "wf_b", hidden: true);
-            Assert.True(Assert.Single(ResumeStopped.RunningWorkflows(project, since, tasks)).Hidden); // cannot resume elsewhere, still running
+            Assert.True(Assert.Single(ResumeStopped.RunningWorkflows(project, since), r => r.RunId == "wf_b").Hidden); // cannot resume elsewhere, still running
             Directory.CreateDirectory(Path.Combine(project, "sid", "workflows"));
             File.WriteAllText(Path.Combine(project, "sid", "workflows", "wf_b.json"), """{"status":"completed"}""");
-            Assert.Empty(ResumeStopped.RunningWorkflows(project, since, tasks)); // settled: its snapshot exists
+            Assert.Equal("wf_a", Assert.Single(ResumeStopped.RunningWorkflows(project, since)).RunId); // wf_b settled: its snapshot exists
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// Two runs in one session: the one that settled writes its snapshot and its task output (`w*.output`, which names no run)
+    /// in the same seconds the other last wrote its journal. That output settles nothing: the other run is still going.
+    [Fact]
+    public void ASiblingRunSettlingNeverHidesOneStillRunning()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        var name = "C--pg-" + Guid.NewGuid().ToString("N");
+        var tasks = Path.Combine(Path.GetTempPath(), "claude", name, "sid", "tasks"); // where Claude Code writes them
+        try
+        {
+            var project = Path.Combine(root, "projects", name);
+            var running = StageRun(project, "sid", "wf_running");
+            StageRun(project, "sid", "wf_done");
+            Directory.CreateDirectory(Path.Combine(project, "sid", "workflows"));
+            File.WriteAllText(Path.Combine(project, "sid", "workflows", "wf_done.json"), """{"status":"completed"}""");
+            Directory.CreateDirectory(tasks);
+            File.WriteAllText(Path.Combine(tasks, "wdone.output"), "the sibling's result");
+            File.SetLastWriteTimeUtc(Path.Combine(tasks, "wdone.output"), File.GetLastWriteTimeUtc(running).AddSeconds(2));
+            var run = Assert.Single(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5)));
+            Assert.Equal("wf_running", run.RunId);
+            Assert.Equal(["k2"], run.InFlight);
+        }
+        finally { Directory.Delete(root, true); Directory.Delete(Path.GetDirectoryName(Path.GetDirectoryName(tasks))!, true); }
+    }
+
+    /// A resume appends to the same journal (no "resumed" line): an agent killed in flight gets a second "started" for its key,
+    /// then one "result". A key is settled once any result or failure exists for it, whatever comes after.
+    [Fact]
+    public void AResumedJournalCountsAKeyInFlightUntilItsFirstResult()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var project = Path.Combine(root, "projects", "C--w");
+            var journal = Path.Combine(project, "sid", "subagents", "workflows", "wf_r", "journal.jsonl");
+            Directory.CreateDirectory(Path.GetDirectoryName(journal)!);
+            string Line(string type, string key, string agent) => $$"""{"type":"{{type}}","key":"{{key}}","agentId":"{{agent}}"}""";
+            string[] InFlight(params string[] lines)
+            {
+                File.WriteAllLines(journal, ["""{"type":"launched"}""", .. lines]);
+                return [.. Assert.Single(ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5))).InFlight];
+            }
+            string[] alphaDone = [Line("started", "alpha", "a1"), Line("result", "alpha", "a1"), Line("started", "beta", "b1")];
+            Assert.Empty(InFlight([.. alphaDone, Line("started", "beta", "b2"), Line("result", "beta", "b2")]));
+            Assert.Equal(["beta"], InFlight([.. alphaDone, Line("started", "beta", "b2")]));
+            Assert.Empty(InFlight([.. alphaDone, Line("failed", "beta", "b1"), Line("started", "beta", "b2")])); // settled at its failure
         }
         finally { Directory.Delete(root, true); }
     }
