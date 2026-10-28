@@ -541,6 +541,38 @@ public class ResumeStoppedTests
         Assert.False(ResumeStopped.SafeToClose(2, none, true, 1, 1, now)); // a switch is running
         Assert.False(ResumeStopped.SafeToClose(2, none, false, 1, 3, now)); // the login moved
     }
+
+    [Fact]
+    public void OnMacAndLinuxOnlyTheRecordedProcessIsEverClosedButUnknownStillHoldsItsProfile()
+    {
+        // Synthetic process facts only: no real process is looked at, let alone killed.
+        var started = new DateTime(2026, 10, 27, 9, 30, 15, DateTimeKind.Utc);
+        const string Stamp = "Tue Oct 27 09:30:15 2026"; // macOS ps lstart, C locale, UTC
+        Func<DateTime> At(DateTime t) => () => t;
+        Func<DateTime> unreadable = () => throw new System.ComponentModel.Win32Exception();
+        Func<string?> claude = () => "/usr/local/bin/claude --resume", none = () => null, other = () => "/usr/bin/vim";
+        bool Mac(string? stamp, Func<DateTime> start, Func<string?> cmd, bool kill) => ResumeStopped.PosixLive(stamp, start, false, none, cmd, kill);
+
+        // A close: the process must be the one that wrote the record.
+        Assert.True(Mac(Stamp, At(started.AddMilliseconds(900)), other, kill: true)); // lstart drops the fraction
+        Assert.False(Mac(null, At(started), claude, kill: true)); // no stamp: not provably that window
+        Assert.False(Mac("  ", At(started), claude, kill: true));
+        Assert.False(Mac("27/10/2026 9:30", At(started), claude, kill: true)); // unparseable
+        Assert.False(Mac(Stamp, At(started.AddMinutes(5)), claude, kill: true)); // the pid went to a later Claude Code session
+        Assert.False(Mac(Stamp, At(started.AddMinutes(5)), none, kill: true)); // ... or to one whose command line cannot be read
+        Assert.False(Mac(Stamp, At(started.AddMinutes(-5)), claude, kill: true));
+        Assert.Throws<System.ComponentModel.Win32Exception>(() => Mac(Stamp, unreadable, claude, kill: true)); // IsLiveClaude: false
+        Assert.False(ResumeStopped.PosixLive("12345", At(started), true, () => "99999", claude, kill: true)); // Linux: other ticks
+
+        // Anything else (is a profile still in use?): unknown means alive, as before.
+        Assert.True(Mac(null, At(started), other, kill: false));
+        Assert.True(Mac("27/10/2026 9:30", At(started), other, kill: false));
+        Assert.True(Mac(Stamp, At(started.AddMinutes(5)), claude, kill: false));
+        Assert.True(Mac(Stamp, At(started.AddMinutes(5)), none, kill: false));
+        Assert.False(Mac(Stamp, At(started.AddMinutes(5)), other, kill: false)); // a later process that is not claude
+        Assert.True(ResumeStopped.PosixLive("12345", At(started), true, () => "12345", other, kill: false));
+        Assert.False(ResumeStopped.PosixLive("12345", At(started), true, () => "99999", claude, kill: false));
+    }
 }
 
 /// Read-only scan of this machine's real Claude windows; set PATCH_GOBLINS_LIVE_SCAN=1. Passes trivially otherwise.

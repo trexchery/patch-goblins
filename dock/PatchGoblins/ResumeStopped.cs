@@ -555,7 +555,7 @@ public static class ResumeStopped
             if (s.Record == null) return true;
             using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
             var r = doc.RootElement;
-            return s.Movable && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
+            return s.Movable && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"), kill: true);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
@@ -783,30 +783,21 @@ public static class ResumeStopped
         return now - first >= grace;
     }
 
-    internal static bool IsLiveClaude(int pid, string? procStart)
+    /// `kill`: the answer decides a close (`Unchanged`), so on macOS and Linux only a process proven to be the one that wrote
+    /// the record counts; without it, unknown means alive, so a live window's profile is never freed. Windows has one rule.
+    internal static bool IsLiveClaude(int pid, string? procStart, bool kill = false)
     {
         try
         {
             using var p = Process.GetProcessById(pid);
             if (p.HasExited) return false;
             if (!OperatingSystem.IsWindows())
-            {
-                // Same stamp conventions as the existing Python engine's
-                // process_detection.pid_matches_record: Linux clock ticks;
-                // macOS ps lstart under C locale and UTC.
-                if (OperatingSystem.IsLinux() && long.TryParse(procStart, out _))
+                return PosixLive(procStart, () => p.StartTime.ToUniversalTime(), OperatingSystem.IsLinux(), () =>
                 {
                     var stat = File.ReadAllText($"/proc/{pid}/stat");
                     var fields = stat[(stat.LastIndexOf(')') + 1)..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-                    return fields.Length > 19 && fields[19] == procStart;
-                }
-                if (string.IsNullOrWhiteSpace(procStart)) return true; // unknown must never free a live profile
-                if (DateTime.TryParseExact(Regex.Replace(procStart, @"\s+", " "), "ddd MMM d HH:mm:ss yyyy",
-                    System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var recorded)
-                    && p.StartTime.ToUniversalTime() > recorded.AddSeconds(2))
-                    return CommandLineOf(pid)?.Contains("claude", StringComparison.OrdinalIgnoreCase) != false;
-                return true;
-            }
+                    return fields.Length > 19 ? fields[19] : null;
+                }, () => CommandLineOf(pid), kill);
             // The record's start stamp names the process that wrote it, so a recycled pid never matches. The image name
             // is only a fallback for unstamped records: Claude Code's updater renames a running claude.exe to
             // claude.exe.old.<stamp>.<pid>, which would hide every window older than the update.
@@ -815,6 +806,20 @@ public static class ResumeStopped
             return NameOf(p.Id) == "claude";
         }
         catch (Exception e) when (e is ArgumentException or IOException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
+    }
+
+    /// `IsLiveClaude` on macOS and Linux, given the live process's start (UTC), its /proc start ticks and its command line.
+    /// Same stamp conventions as the Python engine's process_detection.pid_matches_record: Linux clock ticks; macOS ps lstart
+    /// under C locale and UTC. `kill`: the start must match the record within 2 s, as on Windows; unknown is not a match.
+    internal static bool PosixLive(string? procStart, Func<DateTime> startUtc, bool linux, Func<string?> procTicks, Func<string?> commandLine, bool kill)
+    {
+        if (linux && long.TryParse(procStart, out _)) return procTicks() == procStart;
+        var recorded = default(DateTime);
+        var stamped = !string.IsNullOrWhiteSpace(procStart) && DateTime.TryParseExact(Regex.Replace(procStart, @"\s+", " "), "ddd MMM d HH:mm:ss yyyy",
+            System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out recorded);
+        if (kill) return stamped && Math.Abs((startUtc() - recorded).Ticks) < TimeSpan.TicksPerSecond * 2;
+        if (!stamped) return true; // unknown must never free a live profile
+        return startUtc() <= recorded.AddSeconds(2) || commandLine()?.Contains("claude", StringComparison.OrdinalIgnoreCase) != false;
     }
 
     internal static string? TranscriptOf(string dir, string sessionId, string cwd)

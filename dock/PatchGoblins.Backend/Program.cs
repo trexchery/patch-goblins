@@ -21,7 +21,7 @@ internal static class Program
         if (args is ["guard", _, ..])
         {
             using var why = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
-            return Policy.Guard(args[1..], new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false)).ReadToEnd(), why);
+            return Policy.Hook(args[1..], () => new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false)).ReadToEnd(), why);
         }
         if (args is ["doctor", ..]) return Doctor.Run(args);
         if (args is ["call", var tool, var json, "--repo", var repo])
