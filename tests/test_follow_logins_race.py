@@ -84,3 +84,21 @@ def test_a_timed_out_post_refresh_write_is_healed_by_the_next_tick(temp_home):
     with patch.object(h.switcher, "_live_session_pids", return_value=[4242]):
         assert h.switcher.follow_logins() == {"status": "synced"}
     assert "rt-f" in h.switcher._store._read_account_credentials("1", "a@example.com")
+
+
+def test_a_switch_during_the_refresh_grant_never_writes_into_the_new_accounts_login(temp_home):
+    now = int(time.time() * 1000)
+    h, creds, prof = _rig(temp_home, now + 10 * 60_000)  # inside the refresh window
+    fresh = json.dumps({"claudeAiOauth": {"accessToken": "at-f", "refreshToken": "rt-f", "expiresAt": now + 8 * HOUR}})
+
+    def switch_lands_during_grant(num, email, newest):
+        # cswap's lock is released for the network refresh: the tray's `cswap switch 2` lands here.
+        h.switcher.switch_to("2", json_output=True)
+        return oauth.RefreshOutcome(fresh, None)
+
+    with patch.object(
+        h.switcher, "_live_session_pids", side_effect=lambda n, e: [4242] if n == "1" else []
+    ), patch.object(h.switcher, "consume_backup_grant", side_effect=switch_lands_during_grant):
+        assert h.switcher.follow_logins() == {"status": "alone"}
+    assert h.active_number() == 2  # the switch did land
+    assert _rt(creds) != "rt-f"  # account 1's new generation never lands in account 2's default login
