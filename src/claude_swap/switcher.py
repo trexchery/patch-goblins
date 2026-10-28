@@ -1997,45 +1997,74 @@ class ClaudeAccountSwitcher:
 
         if not self.follows_logins():
             return {"status": "alone"}
-        num = self.current_account_number()
-        account = (self._get_sequence_data() or {}).get("accounts", {}).get(num or "", {})
-        email = account.get("email", "")
-        if not email:
-            return {"status": "alone"}
-        org = account.get("organizationUuid", "") or ""
-        session_dir = self._session_dir(num, email)
-        if (
-            not session_dir.is_dir()
-            or not self._live_session_pids(num, email)
-            or is_session_stale(session_dir)
-            or session_identity_drifted(session_dir, email, org)
-        ):
-            return {"status": "alone"}
+
+        def held() -> tuple[str, str, Path, bool] | None:
+            """The live login's slot, email, profile and stale flag, when a live window follows it."""
+            num = self.current_account_number()
+            account = (self._get_sequence_data() or {}).get("accounts", {}).get(num or "", {})
+            email = account.get("email", "")
+            if not email:
+                return None
+            org = account.get("organizationUuid", "") or ""
+            session_dir = self._session_dir(num, email)
+            if (
+                not session_dir.is_dir()
+                or not self._live_session_pids(num, email)
+                or session_identity_drifted(session_dir, email, org)
+            ):
+                return None
+            return num, email, session_dir, is_session_stale(session_dir)
+
+        # Every read-decide-write holds cswap's lock, then Claude Code's refresh locks
+        # (``_perform_switch``'s order): a switch can never land between reading which
+        # account is live and writing its login, so no other account's login is copied.
         try:
-            newest = self._follow_sync(session_dir)
-            if newest is None:
-                return {"status": "alone"}
-            expires = (oauth.extract_oauth_data(newest) or {}).get("expiresAt")
-            if not isinstance(expires, (int, float)) or expires - time.time() * 1000 > self.FOLLOW_REFRESH_MS:
-                return {"status": "synced"}
-            # The backup holds the newest generation, then the gate refreshes it: serialized with the usage collector.
             with FileLock(self.lock_file):
+                found = held()
+                if found is None:
+                    return {"status": "alone"}
+                num, email, session_dir, stale = found
+                if stale:
+                    # The backup moved under the window (the gate refreshed it, or a
+                    # re-login): follow only to copy a strictly newer backup down to both.
+                    backup = self._store._read_account_credentials(num, email)
+                    newest = self._follow_sync(session_dir, fresh=backup, fresh_only=True)
+                    if newest is None:
+                        return {"status": "alone"}
+                    clear_session_stale(session_dir)
+                    return {"status": "synced"}
+                newest = self._follow_sync(session_dir)
+                if newest is None:
+                    return {"status": "alone"}
+                expires = (oauth.extract_oauth_data(newest) or {}).get("expiresAt")
+                if not isinstance(expires, (int, float)) or expires - time.time() * 1000 > self.FOLLOW_REFRESH_MS:
+                    return {"status": "synced"}
+                # The backup holds the newest generation, then the gate refreshes it: serialized with the usage collector.
                 self._store._write_account_credentials(num, email, newest)
             outcome = self.consume_backup_grant(num, email, newest)
             if outcome.error is not None or not outcome.credentials:
                 return {"status": "refresh-failed", "error": outcome.error}
-            self._follow_sync(session_dir, fresh=outcome.credentials)
-            clear_session_stale(session_dir)  # the gate's persist marked it; both copies now hold the backup's generation
+            with FileLock(self.lock_file):
+                if (held() or ())[:3] != (num, email, session_dir):
+                    return {"status": "alone"}  # switched meanwhile: the new generation stays in num's backup
+                self._follow_sync(session_dir, fresh=outcome.credentials)
+                clear_session_stale(session_dir)  # the gate's persist marked it; both copies now hold the backup's generation
             return {"status": "refreshed"}
         except ClaudeCodeLockTimeout:
+            # The stale mark stays when the post-refresh write could not run: the next
+            # tick copies the backup's newer generation down (the ``stale`` arm above).
             return {"status": "busy"}
 
-    def _follow_sync(self, session_dir: Path, fresh: str | None = None) -> str | None:
+    def _follow_sync(
+        self, session_dir: Path, fresh: str | None = None, fresh_only: bool = False
+    ) -> str | None:
         """Under both config dirs' refresh locks: the copy with the latest
         ``expiresAt`` (of the default login's, the profile's and ``fresh``)
         replaces the older ones' OAuth login. Only the ``claudeAiOauth`` object
         moves; each file keeps its own other fields. Returns the newest login,
-        None when none is usable. Never logs a token."""
+        None when none is usable. ``fresh_only``: write nothing (None) unless
+        ``fresh`` is strictly the newest. The caller holds ``self.lock_file``.
+        Never logs a token."""
         from claude_swap.claude_locks import claude_credentials_lock
         from claude_swap.session import read_session_credentials
         from claude_swap.settings import atomic_write_json
@@ -2062,6 +2091,8 @@ class ClaudeAccountSwitcher:
             profile = read_session_credentials(session_dir)
             best = max((c for c in (default, profile, fresh) if c), key=expires, default=None)
             if best is None or expires(best) < 0:
+                return None
+            if fresh_only and not expires(fresh) > max(expires(default), expires(profile)):
                 return None
             # Only a copy that holds a readable, older login is replaced: an unreadable or foreign file is left alone.
             if 0 <= expires(default) < expires(best):
