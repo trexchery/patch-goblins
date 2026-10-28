@@ -19,7 +19,7 @@ public sealed class PosixAdapterTests
         var run = Path.Combine(project, "old-sid", "subagents", "workflows", "wf_a");
         Directory.CreateDirectory(run);
         File.WriteAllLines(Path.Combine(run, "journal.jsonl"), ["""{"type":"launched"}""", """{"type":"started","key":"k","agentId":"a","label":"x","phase":"P"}"""]);
-        var runs = ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5), Path.Combine(tmp.Path, "tmp"));
+        var runs = ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5));
         Assert.Equal(["k"], Assert.Single(runs).InFlight);
         var idle = new StoppedSession(1, "sid", "/w", Path.Combine(tmp.Path, "profile"), 3, Path.Combine(project, "sid.jsonl"), false, Runs: runs);
         ResumeStopped.Step Of(StoppedSession s) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true);
@@ -44,7 +44,7 @@ public sealed class PosixAdapterTests
         File.WriteAllLines(Path.Combine(run, "journal.jsonl"), ["""{"type":"launched"}""", """{"type":"started","key":"k","agentId":"a","label":"x","phase":"P"}"""]);
         File.WriteAllLines(Path.Combine(run, "agent-a.jsonl"), ["""{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{"model":"<synthetic>","role":"assistant","content":[]}}"""]);
         var s = new StoppedSession(1, "sid", "/w", Path.Combine(tmp.Path, "profile"), 3, Path.Combine(project, "sid.jsonl"), true,
-            Runs: ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5), Path.Combine(tmp.Path, "tmp")));
+            Runs: ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5)));
         ResumeStopped.Step Of(bool on) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true, on, DateTime.UtcNow);
         Assert.Equal(ResumeStopped.Step.Left, Of(false));
         Assert.Equal(ResumeStopped.Step.Move, Of(true));

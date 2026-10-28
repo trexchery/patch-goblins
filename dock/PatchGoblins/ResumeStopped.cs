@@ -258,12 +258,10 @@ public static class ResumeStopped
 
     /// The workflow runs still going in a project folder (`projects/<cwd>`), as of a window started at `sinceUtc`. Every session
     /// folder is looked at: after /clear or a fork a background run keeps writing under the old session id. A run counts when its
-    /// journal was written since the window started, it has no settlement snapshot (`<sid>/workflows/<run>.json`), and no non-empty
-    /// `w*.output` in the session's tasks folder (`tasksRoot`/<sid>/tasks; Claude Code's temp folder by default) was written as it settled.
-    /// ponytail: an output is matched to its run by time (written within 10 s after the journal's last line), as its name carries no run id.
-    public static List<WorkflowRun> RunningWorkflows(string projectDir, DateTime sinceUtc, string? tasksRoot = null)
+    /// journal was written since the window started (a run of a dead process is older) and it has no settlement snapshot
+    /// (`<sid>/workflows/<run>.json`, written only as it settles). Task outputs (`w*.output`) are not used: they name no run.
+    public static List<WorkflowRun> RunningWorkflows(string projectDir, DateTime sinceUtc)
     {
-        tasksRoot ??= Path.Combine(Path.GetTempPath(), "claude", Path.GetFileName(projectDir));
         var runs = new List<WorkflowRun>();
         try
         {
@@ -272,7 +270,6 @@ public static class ResumeStopped
                 var root = Path.Combine(session, "subagents", "workflows");
                 if (!Directory.Exists(root)) continue;
                 var sid = Path.GetFileName(session);
-                var outputs = Path.Combine(tasksRoot, sid, "tasks");
                 foreach (var run in Directory.EnumerateDirectories(root, "wf_*"))
                 {
                     var journal = Path.Combine(run, "journal.jsonl");
@@ -280,8 +277,6 @@ public static class ResumeStopped
                     var wrote = File.GetLastWriteTimeUtc(journal);
                     var id = Path.GetFileName(run);
                     if (wrote <= sinceUtc || File.Exists(Path.Combine(session, "workflows", id + ".json"))) continue;
-                    if (Directory.Exists(outputs) && Directory.EnumerateFiles(outputs, "w*.output").Select(f => new FileInfo(f))
-                            .Any(f => f.Length > 0 && f.LastWriteTimeUtc >= wrote.AddSeconds(-1) && f.LastWriteTimeUtc <= wrote.AddSeconds(10))) continue;
                     if (ReadRun(sid, run) is { } read) runs.Add(read);
                 }
             }
@@ -297,7 +292,9 @@ public static class ResumeStopped
         {
             var journal = Path.Combine(run, "journal.jsonl");
             var hidden = false;
-            var open = new Dictionary<string, string>(); // started key -> agent id, until its result or failure (a resumed key starts again, then settles)
+            // A resume appends to this journal (no "resumed" line): a killed agent's key is started again (new agent id). A key is done at its first result or failure.
+            var open = new Dictionary<string, string>(); // started key -> latest agent id
+            var done = new HashSet<string>();
             var keys = new StringBuilder();
             using (var reader = new StreamReader(new FileStream(journal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)))
                 for (var line = reader.ReadLine(); line != null; line = reader.ReadLine())
@@ -308,8 +305,8 @@ public static class ResumeStopped
                         switch (Str(r, "type"))
                         {
                             case "launched": hidden |= r.TryGetProperty("hiddenScriptSha256", out var h) && h.ValueKind == JsonValueKind.String; break;
-                            case "started" when Str(r, "key") is { } k: open[k] = Str(r, "agentId") ?? ""; keys.Append($"s {k} {open[k]}\n"); break;
-                            case "result" or "failed" when Str(r, "key") is { } k: open.Remove(k); keys.Append($"r {k}\n"); break;
+                            case "started" when Str(r, "key") is { } k && !done.Contains(k): open[k] = Str(r, "agentId") ?? ""; keys.Append($"s {k} {open[k]}\n"); break;
+                            case "result" or "failed" when Str(r, "key") is { } k: done.Add(k); open.Remove(k); keys.Append($"r {k}\n"); break;
                         }
                     }
                     catch (JsonException) { } // a line being written
