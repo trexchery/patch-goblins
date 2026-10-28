@@ -44,6 +44,16 @@ public class PosixPolicyTests
     }
 
     [Fact]
+    public void AnEmptyRootNeverCoversEverything()
+    {
+        const string read = """{"file_path":"/etc/hosts"}""";
+        Assert.Equal(2, Guard("Read", read, [""]));
+        Assert.Equal(2, Guard("Read", read, ["/Users/x/wt/k-21", " "]));
+        Assert.Equal(2, Guard("Read", """{"file_path":"/Users/x/wt/k-21/a"}""", ["/Users/x/wt/k-21", ""]));
+        Assert.Equal(2, Policy.Hook([""], () => """{"cwd":"/w","tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}""", TextWriter.Null));
+    }
+
+    [Fact]
     public void ARootThatIsTheFilesystemRootCoversEverythingAndTheHomeIsExpanded()
     {
         Assert.True(Policy.Covers("/", "/etc/hosts", posix: true));

@@ -9,6 +9,42 @@ namespace PatchGoblins.Tests;
 
 public sealed class PosixAdapterTests
 {
+    /// The check right before a close holds only for the process that wrote the record: a missing, unreadable or other
+    /// start stamp is not a match (unknown means alive only where nothing is killed). Reads only; this process is the pid.
+    [Fact]
+    public void AWindowIsClosedOnlyWhenTheRecordProvesItsProcess()
+    {
+        if (OperatingSystem.IsWindows()) return; // POSIX start stamps: runs on Linux and macOS
+        using var tmp = new TempDir();
+        var transcript = Path.Combine(tmp.Path, "sid.jsonl");
+        var record = Path.Combine(tmp.Path, "1.json");
+        File.WriteAllText(transcript, """{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"All done."}]}}""");
+        var s = new StoppedSession(Environment.ProcessId, "sid", tmp.Path, tmp.Path, 3, transcript, false, record, File.GetLastWriteTimeUtc(transcript));
+        Assert.True(s.Movable);
+        bool With(string? procStart)
+        {
+            File.WriteAllText(record, JsonSerializer.Serialize(new { pid = Environment.ProcessId, sessionId = "sid", cwd = tmp.Path, status = "idle", kind = "interactive", procStart }));
+            return ResumeStopped.Unchanged(s);
+        }
+        string real, other;
+        if (OperatingSystem.IsLinux())
+        {
+            var stat = File.ReadAllText($"/proc/{Environment.ProcessId}/stat"); // field 22, start time in clock ticks
+            real = stat[(stat.LastIndexOf(')') + 1)..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)[19];
+            other = (long.Parse(real) + 1000).ToString();
+        }
+        else
+        {
+            string Lstart(DateTime t) => t.ToString("ddd MMM d HH:mm:ss yyyy", System.Globalization.CultureInfo.InvariantCulture); // ps lstart, C locale, UTC
+            var start = Process.GetCurrentProcess().StartTime.ToUniversalTime();
+            (real, other) = (Lstart(start), Lstart(start.AddHours(-1)));
+        }
+        Assert.False(With(null));
+        Assert.False(With("not a start time"));
+        Assert.False(With(other));
+        Assert.True(With(real));
+    }
+
     [Fact]
     public async Task AStaleRecoveryRecordNeverKillsAnUnrelatedProcessGroup()
     {

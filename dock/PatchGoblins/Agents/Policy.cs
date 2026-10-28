@@ -273,6 +273,12 @@ public static class Policy
 
     internal static int Guard(string[] roots, string input, TextWriter why, bool posix, bool mac = false)
     {
+        // An empty root resolves to `/` on POSIX, which would let every path through: refuse instead.
+        if (roots.Length == 0 || roots.Any(string.IsNullOrWhiteSpace))
+        {
+            why.WriteLine("Patch Goblins has no folder to confine this agent to, so the call is refused.");
+            return 2;
+        }
         List<string> targets;
         try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), posix); }
         catch (Exception e) when (e is JsonException or InvalidOperationException or ArgumentException or KeyNotFoundException or NotSupportedException or IndexOutOfRangeException)
