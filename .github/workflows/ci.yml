@@ -4,11 +4,32 @@ on:
   push:
     branches: [main, feat/windows-tray]
     paths-ignore: ['**.md', 'assets/**', 'docs/**']
-  pull_request: # every pull request: main requires these checks, so a docs-only one would wait forever
+  pull_request: # every pull request: main requires these checks; `changes` skips them for docs-only ones
     branches: [main]
 
 jobs:
+  # A docs-only pull request skips the suites below. A job skipped by its `if`
+  # reports success, so the required checks pass in seconds. Anything unclear
+  # (a failed detection, an empty diff) runs everything.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        if: github.event_name == 'pull_request'
+        run: |
+          files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
+          if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '\.md$|^assets/|^docs/'; then
+            echo docs_only=true >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -29,6 +50,8 @@ jobs:
         run: uv run pytest
 
   test-windows:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
 
     steps:
@@ -60,6 +83,8 @@ jobs:
   # the name branch protection matches on, and renaming it silently drops the
   # required check.
   macos-keychain:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: macos-latest
 
     steps:

@@ -1,8 +1,9 @@
 name: macOS application
 
 on:
-  pull_request:
+  pull_request: # not a required check, so docs-only pull requests can skip it outright
     branches: [main]
+    paths-ignore: ['**.md', 'assets/**', 'docs/**']
   push:
     branches: [feat/macos-parity]
     tags: ['v*']
