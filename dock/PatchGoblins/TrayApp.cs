@@ -418,12 +418,12 @@ public sealed partial class TrayApp : ApplicationContext
                 continue;
             }
             if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
-            var target = s.Movable ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
+            var target = s.Movable || _settings.MoveWorkflows && s.Running ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
                 line: _settings.AutoLine ? a => _line.For(a, s.Model) : null) : null;
             // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             var key = $"{s.SessionId}#{target}";
             var step = ResumeStopped.Decide(s, ResumeStopped.UserIdle(), TypingPause, target, _resumed.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
-                ResumeStopped.MovesInLastHour(_resumed, s.SessionId, DateTime.UtcNow), () => ResumeStopped.Unchanged(s));
+                ResumeStopped.MovesInLastHour(_resumed, s.SessionId, DateTime.UtcNow), () => ResumeStopped.Unchanged(s, workflows: _settings.MoveWorkflows), _settings.MoveWorkflows, DateTime.UtcNow);
             switch (step)
             {
                 case ResumeStopped.Step.Left: // never closed while working; reopened once it is idle at the limit (the poll looks again)
@@ -495,7 +495,7 @@ public sealed partial class TrayApp : ApplicationContext
             await Task.Run(Copy);
             // The copy can take long: someone may have typed, or the window closed, or an account been refused and the login moved on, meanwhile.
             // A switch still running counts as the login moving: launching the account it moves to would leave two live copies of it.
-            if (!ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < (s.AtLimit ? TypingPause : TimeSpan.FromSeconds(60))) return null;
+            if (!ResumeStopped.Unchanged(s, workflows: _settings.MoveWorkflows) || ResumeStopped.UserIdle() < (s.AtLimit ? TypingPause : TimeSpan.FromSeconds(60))) return null;
             if (!ResumeStopped.SafeToClose(account.Number, _limits.RefusedUntil, _limits.Switching || _engineSwitches > 0, login, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow))
             {
                 Program.Log($"move {s.SessionId} to #{account.Number} dropped: the login or the limits moved since the plan");
@@ -503,32 +503,65 @@ public sealed partial class TrayApp : ApplicationContext
             }
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the launch, which can wait 10 s: a concurrent switch must not pick this account meanwhile
             var spot = WindowSpot.Of(s.Pid); // the new window opens where this one is, on top of it
-            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); } // what the transcript holds now: the new window then owns it
-            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
-            // The new window first, the old one only once it is up: a launch that fails leaves the old window as it was.
-            var up = await WindowSpot.OpenAtAsync(spot, () =>
+            // Workflows running (MoveWorkflows, `Paused`): the old window is closed first, as its runs must stop before the new one resumes them.
+            var args = Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, s.Running ? dir : null));
+            var up = false;
+            async Task<bool> Open()
             {
-                for (var attempt = 0; ; attempt++)
+                up = await WindowSpot.OpenAtAsync(spot, () =>
                 {
-                    try
+                    for (var attempt = 0; ; attempt++)
                     {
-                        _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
-                            Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s)));
-                        break;
+                        try
+                        {
+                            _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd, args);
+                            break;
+                        }
+                        catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more
                     }
-                    catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more
+                });
+                return up;
+            }
+            async Task<bool> OpenPaused()
+            {
+                try { await Open(); return true; } // a window not seen still opened
+                catch (Exception e) { Program.Log(e); return false; }
+            }
+            // The new window first, the old one only once it is up: a launch that fails leaves the old window as it was.
+            var swapped = await ResumeStopped.SwapAsync(s.Running,
+                async () =>
+                {
+                    await Task.Run(Copy); // what the transcript holds now: the new window then owns it
+                    _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
+                },
+                s.Running ? OpenPaused : Open,
+                // Someone typed or a turn started in the old window while the new one opened: it is not closed under them.
+                () => ResumeStopped.Unchanged(s) && ResumeStopped.UserIdle() >= TimeSpan.FromSeconds(60),
+                () => ResumeStopped.CloseAsync(s.Pid, s.Record));
+            var folder = Path.GetFileName(s.Cwd.TrimEnd('\\'));
+            if (s.Running)
+            {
+                var runs = string.Join(", ", s.Runs!.Select(r => r.RunId));
+                Program.Log($"workflows {runs} in {folder} paused: #{s.Account} to #{account.Number}{(swapped == true ? "" : swapped == null ? ", old window did not exit" : ", relaunch failed")}");
+                if (swapped == null)
+                {
+                    Notify("A paused workflow's window did not close", $"Nothing was moved. Once it has exited, in {s.Cwd}: cswap run {account.Number} -- --resume {s.SessionId} (paused workflows {runs})", ToolTipIcon.Warning);
+                    return null;
                 }
-            });
-            // Someone typed or a turn started in the old window while the new one opened: it is not closed under them.
-            if (!up || !ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60))
+                if (swapped != true)
+                {
+                    Notify("Could not reopen a paused workflow", $"Run {runs} again in {s.Cwd}: cswap {string.Join(' ', args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a))}", ToolTipIcon.Warning);
+                    return null;
+                }
+            }
+            else if (swapped == null)
             {
                 Program.Log($"old window of {s.SessionId} kept: {(up ? "it was used while the new one opened" : "the new window was not seen")}");
-                Notify("Opened a new window; the old one is still open", $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} is on #{account.Number} in the new window. Close whichever you do not want.", ToolTipIcon.Warning);
-                return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
+                Notify("Opened a new window; the old one is still open", $"{folder} is on #{account.Number} in the new window. Close whichever you do not want.", ToolTipIcon.Warning);
+                return (s.AtLimit, $"{folder} on #{account.Number}");
             }
-            await ResumeStopped.CloseAsync(s.Pid, s.Record);
-            Program.Log($"nudge {s.SessionId} relaunched #{s.Account} on #{account.Number}");
-            return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
+            else Program.Log($"nudge {s.SessionId} relaunched #{s.Account} on #{account.Number}");
+            return (s.AtLimit, $"{folder} on #{account.Number}");
         }
         catch (Exception e)
         {
@@ -1055,6 +1088,7 @@ public sealed partial class TrayApp : ApplicationContext
         f.DraftPrs.Checked = _settings.AgentDraftPrs;
         f.Ultracode.Checked = _settings.AgentUltracode;
         f.AskApproval.Checked = _settings.AskApproval;
+        f.MoveWorkflows.Checked = _settings.MoveWorkflows;
         f.CancelClicked += _dash.CloseSettings;
         f.SaveClicked += () => _ = SaveSettingsAsync(f);
         if (!_dash.Visible) ShowDashboard();
@@ -1078,6 +1112,12 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AgentUltracode = f.Ultracode.Checked;
             _settings.AskApproval = f.AskApproval.Checked;
             _settings.AutoLine = f.AutoLine.Checked;
+            // Once, like auto-switch's policy: the owner agrees that agents caught mid-run start over.
+            if (f.MoveWorkflows.Checked && !_settings.MoveWorkflowsAccepted
+                && MessageBox.Show(DockSettings.MoveWorkflowsConsent + "\n\nMove running workflows?", "Patch Goblins — move running workflows",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                _settings.MoveWorkflowsAccepted = true;
+            _settings.MoveWorkflows = f.MoveWorkflows.Checked && _settings.MoveWorkflowsAccepted;
             ApplyAgentSettings();
             _settings.Save();
             _timer.Interval = TimerMs;

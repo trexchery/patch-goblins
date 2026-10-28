@@ -515,7 +515,7 @@ public class ResumeStoppedTests
             Assert.Equal(1, ResumeStopped.Target(s, [A(1, 20), A(3, 93)], _ => true, threshold: 90, hysteresis: 10));
             Assert.True(ResumeStopped.Unchanged(s));
 
-            await ResumeStopped.CloseAsync(s.Pid, s.Record);
+            Assert.True(await ResumeStopped.CloseAsync(s.Pid, s.Record)); // it reports the exit
             Assert.True(claude.HasExited);
             Assert.False(File.Exists(record)); // killed, Claude Code would leave it for a reused pid to revive
             ResumeStopped.CopyTranscript(s, to);
@@ -698,6 +698,184 @@ public class ResumeStoppedTests
             Assert.Equal(ResumeStopped.Step.Ignore, ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true));
         }
         finally { Directory.Delete(root, true); }
+    }
+
+    const string ToolUse = """{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git push"}}]}}""";
+    const string Background = """{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"npm test","run_in_background":true}}]}}""";
+    const string BackgroundStarted = """{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"Command running in background"}]}}""";
+
+    /// `StageRun` plus the run's script, where Claude Code keeps it: `<sid>/workflows/scripts/<name>-<run>.js`.
+    static string StageResumableRun(string project, string sid, string run)
+    {
+        var journal = StageRun(project, sid, run);
+        Directory.CreateDirectory(Path.Combine(project, sid, "workflows", "scripts"));
+        File.WriteAllText(Path.Combine(project, sid, "workflows", "scripts", $"go-{run}.js"), "export default async () => {}");
+        return journal;
+    }
+
+    /// MoveWorkflows: a window's workflows move at a safe point (no agent in flight, journal quiet 20 s) or once every agent in flight is
+    /// parked at a 429, never while an agent is mid-tool or holds a background command, however full the account. Synthetic runs only.
+    [Fact]
+    public void AWorkflowMovesOnlyAtASafePointOrWithEveryAgentParked()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var project = Path.Combine(root, "projects", "C--w");
+            var journal = StageResumableRun(project, "sid", "wf_1");
+            var agent = Path.Combine(Path.GetDirectoryName(journal)!, "agent-a2.jsonl");
+            var now = DateTime.UtcNow;
+            StoppedSession Window(bool atLimit = false, string? dir = null) => new(1, "sid", @"C:\w", dir ?? Path.Combine(root, "profile"), 3,
+                Path.Combine(project, "sid.jsonl"), atLimit, Runs: ResumeStopped.RunningWorkflows(project, now.AddMinutes(-5)));
+            ResumeStopped.Step Of(StoppedSession s, bool on = true, DateTime? at = null) =>
+                ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, ResumeStopped.Target(s, [A(3, 98), A(4, 10)], _ => true, threshold: 90), false, 0, () => true, on, at ?? now);
+
+            File.WriteAllLines(agent, [Done]); // k1 has its result, k2 is still working: no safe point, and k2 is not held by the limit
+            Assert.Equal(ResumeStopped.Step.Wait, Of(Window()));
+            Assert.False(ResumeStopped.Paused(Window(), now));
+
+            File.WriteAllLines(agent, [Done, Parked429]); // k2 parked at a 429 (trigger B)
+            Assert.True(ResumeStopped.Paused(Window(), now));
+            Assert.Equal(ResumeStopped.Step.Move, Of(Window()));
+            Assert.Equal(ResumeStopped.Step.Move, Of(Window(atLimit: true)));
+            Assert.Equal(ResumeStopped.Step.Ignore, Of(Window(), on: false)); // setting off: the safety fix as it was
+            Assert.Equal(ResumeStopped.Step.Left, Of(Window(atLimit: true), on: false));
+            Assert.Equal(ResumeStopped.Step.Ignore, Of(Window(dir: ResumeStopped.DefaultDir))); // not a `cswap run` window
+            Assert.Equal(ResumeStopped.Step.Ignore, Of(Window() with { SessionId = "other" })); // another session's run cannot resume here
+            Assert.Equal(ResumeStopped.Step.Ignore, Of(Window() with { Runs = [Window().Runs![0] with { Script = null }] })); // no script on disk
+
+            File.WriteAllLines(agent, [Done, ToolUse]); // k2 mid-tool: waited for, even at 98% and at the limit
+            Assert.Equal(["k2"], Window().Runs![0].Busy);
+            Assert.Equal(ResumeStopped.Step.Wait, Of(Window()));
+            Assert.Equal(ResumeStopped.Step.Wait, Of(Window(atLimit: true)));
+            File.WriteAllLines(agent, [Background, BackgroundStarted, Parked429]); // parked, but its background command is still open
+            Assert.Equal(ResumeStopped.Step.Wait, Of(Window(atLimit: true)));
+
+            File.AppendAllText(journal, """{"type":"result","key":"k2","agentId":"a2","result":null}""" + "\n"); // nothing in flight (trigger A)
+            Assert.Empty(Window().Runs![0].InFlight);
+            Assert.Equal(ResumeStopped.Step.Wait, Of(Window())); // the journal was just written
+            Assert.Equal(ResumeStopped.Step.Move, Of(Window(), at: DateTime.UtcNow + ResumeStopped.SafePoint));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// A paused window's last look is on what was said and the journal's keys: the request lines a live window writes all along change
+    /// nothing, a message or a new key does. Without MoveWorkflows it never holds. This process stands in for the window (nothing is closed).
+    [Fact]
+    public void APausedWorkflowWindowIsUnchangedUntilSomethingIsSaidOrAKeyIsWritten()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var project = Path.Combine(root, "projects", "C--w");
+            var journal = StageResumableRun(project, "sid", "wf_1");
+            var agent = Path.Combine(Path.GetDirectoryName(journal)!, "agent-a2.jsonl");
+            var t = Path.Combine(project, "sid.jsonl");
+            var rec = Path.Combine(root, "1.json");
+            File.WriteAllLines(t, [Typed, Done]);
+            File.WriteAllText(rec, Rec("idle"));
+            var s = new StoppedSession(Environment.ProcessId, "sid", root, root, 3, t, false, rec, File.GetLastWriteTimeUtc(t),
+                Runs: ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5)), Said: Done);
+            Assert.True(ResumeStopped.Unchanged(s, workflows: true));
+            Assert.False(ResumeStopped.Unchanged(s)); // setting off: refused, as the safety fix has it
+
+            File.AppendAllText(t, """{"type":"api-request","requestId":"r1"}""" + "\n");
+            File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(5));
+            Assert.True(ResumeStopped.Unchanged(s, workflows: true)); // a request line alone: no change
+
+            var keys = File.ReadAllText(journal);
+            File.AppendAllText(journal, """{"type":"started","key":"k3","agentId":"a3","label":"three","phase":"P"}""" + "\n");
+            Assert.False(ResumeStopped.Unchanged(s, workflows: true)); // a new journal key
+            File.WriteAllText(journal, keys);
+            Assert.True(ResumeStopped.Unchanged(s, workflows: true));
+            File.AppendAllText(agent, Typed + "\n");
+            Assert.False(ResumeStopped.Unchanged(s, workflows: true)); // the parked agent carried on
+            File.WriteAllLines(agent, [Done, Parked429]);
+            Assert.True(ResumeStopped.Unchanged(s, workflows: true));
+
+            File.WriteAllText(rec, Rec("busy"));
+            Assert.False(ResumeStopped.Unchanged(s, workflows: true)); // a turn started
+            File.WriteAllText(rec, Rec("idle"));
+            File.AppendAllText(t, Typed + "\n");
+            Assert.False(ResumeStopped.Unchanged(s, workflows: true)); // a new user line
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// The order of a move: a window running workflows is closed before it is copied and its replacement launched (its runs must stop first);
+    /// any other window keeps today's order, the new window first and the old one closed only once it is still unchanged.
+    [Fact]
+    public async Task AWorkflowWindowIsClosedBeforeItsReplacementLaunches()
+    {
+        var log = new List<string>();
+        Task<bool?> Swap(bool workflows, bool launched = true, bool still = true, bool exited = true) => ResumeStopped.SwapAsync(workflows,
+            () => { log.Add("copy"); return Task.CompletedTask; }, () => { log.Add("launch"); return Task.FromResult(launched); },
+            () => { log.Add("recheck"); return still; }, () => { log.Add("close"); return Task.FromResult(exited); });
+
+        Assert.True(await Swap(workflows: true));
+        Assert.Equal(["close", "copy", "launch"], log);
+        log.Clear();
+        Assert.False(await Swap(workflows: true, launched: false)); // the caller tells the owner the command and the run ids
+        Assert.Equal(["close", "copy", "launch"], log);
+        log.Clear();
+        Assert.Null(await Swap(workflows: true, exited: false)); // the killed claude is still there: its runs may be going, nothing copied or launched
+        Assert.Equal(["close"], log);
+        log.Clear();
+        Assert.True(await Swap(workflows: false, exited: false)); // a window without workflows keeps today's order: closed last, its exit not awaited
+        Assert.Equal(["copy", "launch", "recheck", "close"], log);
+        log.Clear();
+        Assert.True(await Swap(workflows: false));
+        Assert.Equal(["copy", "launch", "recheck", "close"], log);
+        log.Clear();
+        Assert.Null(await Swap(workflows: false, still: false)); // used while the new one opened: kept
+        Assert.Equal(["copy", "launch", "recheck"], log);
+    }
+
+    /// A window running a background workflow keeps its record "busy" until the run settles. At its limit, with every agent parked, it still
+    /// moves once its main transcript says the turn is over; one whose main loop is mid-tool stays. Before the limit a busy window is not
+    /// a candidate at all: workflow windows move at the limit, not at trigger A, unless their record goes idle.
+    [Fact]
+    public void ABusyWorkflowWindowMovesOnlyAtItsLimitWithItsTurnOver()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var now = DateTime.UtcNow;
+            var agent = new Dictionary<string, Limit> { ["sid"] = new(null, null, now.AddSeconds(30)) }; // the parked agent's 429
+            List<StoppedSession> Scan(Dictionary<string, Limit>? limits) => ResumeStopped.Scan([(root, 3)], now.AddSeconds(60), DateTime.MinValue, includeBusy: true, agentLimits: limits);
+            ResumeStopped.Step Of(StoppedSession s) =>
+                ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, ResumeStopped.Target(s, [A(3, 98), A(4, 10)], _ => true, threshold: 90), false, 0, () => true, true, now);
+
+            Stage(root, "busy", [Typed, Done]);
+            StageResumableRun(Path.Combine(root, "projects", "C--w"), "sid", "wf_1");
+            var s = Assert.Single(Scan(agent));
+            Assert.True(s.AtLimit && s.TurnOver && s.Done && !s.Movable);
+            Assert.Equal(ResumeStopped.Step.Move, Of(s));
+            Assert.Empty(Scan(null)); // before the limit: not a candidate
+
+            Stage(root, "busy", [Typed, ToolUse]); // the main loop is in a tool of its own
+            StageResumableRun(Path.Combine(root, "projects", "C--w"), "sid", "wf_1");
+            s = Assert.Single(Scan(agent));
+            Assert.False(s.TurnOver || s.Done);
+            Assert.Equal(ResumeStopped.Step.Left, Of(s));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void APausedWindowIsToldHowToResumeEachRun()
+    {
+        var s = new StoppedSession(1, "sid", @"C:\w", @"C:\cfg", 3, @"C:\cfg\projects\C--w\sid.jsonl", false, Runs: [
+            new WorkflowRun("sid", "wf_1", false, [], [], Script: @"C:\cfg\projects\C--w\sid\workflows\scripts\go-wf_1.js"),
+            new WorkflowRun("sid", "wf_2", false, ["k"], ["k"], Script: @"C:\cfg\projects\C--w\sid\workflows\scripts\fix-wf_2.js")]);
+        const string To = @"C:\Users\x\.claude-swap-backup\sessions\2-a@b.c";
+        var args = ResumeStopped.ResumeArgs(s, To);
+        Assert.Equal(["--resume", "sid"], args[..2]);
+        Assert.Equal("Resume the paused workflow by calling Workflow with scriptPath C:/Users/x/.claude-swap-backup/sessions/2-a@b.c/projects/C--w/sid/workflows/scripts/go-wf_1.js and resumeFromRunId wf_1. "
+            + "Resume the paused workflow by calling Workflow with scriptPath C:/Users/x/.claude-swap-backup/sessions/2-a@b.c/projects/C--w/sid/workflows/scripts/fix-wf_2.js and resumeFromRunId wf_2.", args[2]);
+        Assert.DoesNotContain(args[2], c => c is '"' or '\'' or ';' or '\\'); // nothing a shell or the console launch would take apart
+        Assert.StartsWith(ResumeStopped.Prompt + " Resume the paused workflow", ResumeStopped.ResumeArgs(s with { AtLimit = true }, To)[2]);
+        Assert.Equal(["--resume", "sid"], ResumeStopped.ResumeArgs(s with { Runs = null }, To)); // no workflows: as before
     }
 }
 

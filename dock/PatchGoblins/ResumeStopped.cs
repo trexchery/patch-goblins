@@ -12,19 +12,26 @@ namespace PatchGoblins;
 /// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
-    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null)
+    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null, string? Said = null, bool TurnOver = false)
 {
     public bool Idle => Status == "idle";
     /// A workflow run is still going in the window's project folder: the window looks idle, but closing it would end the run.
     public bool Running => Runs is { Count: > 0 };
     /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
-    /// so the background command runs on to its end (the reopened window is told). Never while a workflow runs.
-    public bool Movable => (Idle || AtLimit && Status == "shell") && !Running;
+    /// so the background command runs on to its end (the reopened window is told). A window running workflows keeps its record
+    /// "busy" until they settle, so at its limit "busy" counts too when the main transcript says its turn is over (`TurnOver`:
+    /// it ends at a finished reply or at its own limit error); only `Paused` then lets it move, and never before the limit.
+    public bool Done => Idle || AtLimit && (Status == "shell" || Status == "busy" && Running && TurnOver);
+    /// `Done` and no workflow running. (With MoveWorkflows on, a window running one moves only once `Paused`.)
+    public bool Movable => Done && !Running;
 }
 
 /// A Claude Code workflow run that has not settled (`RunId` "wf_..." under session `SessionId`). `Hidden`: started from a hidden
 /// script, which a new process cannot resume. `InFlight`: agent keys started without a result; `Parked`: those whose agent sits at a 429.
-public sealed record WorkflowRun(string SessionId, string RunId, bool Hidden, IReadOnlyList<string> InFlight, IReadOnlyList<string> Parked);
+/// `Busy`: in-flight keys whose agent is mid-tool (its last message a tool call) or has a background command open. `Wrote`: the journal's
+/// last write; `Script`: the run's script file; `Dir`: its run folder; `Mark`: its journal keys and in-flight agents' last messages, as one hash.
+public sealed record WorkflowRun(string SessionId, string RunId, bool Hidden, IReadOnlyList<string> InFlight, IReadOnlyList<string> Parked,
+    IReadOnlyList<string>? Busy = null, DateTime Wrote = default, string? Script = null, string? Dir = null, string? Mark = null);
 
 /// A usage-limit stop as Claude Code recorded it: the window that ran out ("five_hour", "seven_day", ...), when it
 /// resets, and when the stop happened. Default fields: an older error without the details.
@@ -50,8 +57,46 @@ public static class ResumeStopped
 
     /// Claude args that reopen `s` on another account: a stopped turn is told to carry on, a finished one
     /// just waits for its user again.
-    public static string[] ResumeArgs(StoppedSession s) =>
-        s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
+    /// A window paused with workflows running is told, per run, how to resume it; `configDir` is where it reopens (its copy of the script).
+    public static string[] ResumeArgs(StoppedSession s, string? configDir = null) =>
+        s.Running ? ["--resume", s.SessionId, string.Join(" ", new[] { s.AtLimit ? Prompt + (s.Status == "shell" ? Background : "") : null }.Concat(s.Runs!.Select(r =>
+                $"Resume the paused workflow by calling Workflow with scriptPath {ScriptIn(s, r, configDir).Replace('\\', '/')} and resumeFromRunId {r.RunId}.")).OfType<string>())]
+        : s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
+
+    /// A run's script as `CopyTranscript` puts it under `configDir` (`projects/<project>/<sid>/workflows/scripts/<name>`); null: where it is.
+    /// ponytail: a quote or ';' in that path (a profile folder named so) would reach the prompt as is; none of Claude Code's own names have one.
+    static string ScriptIn(StoppedSession s, WorkflowRun r, string? configDir) =>
+        configDir == null ? r.Script! : Path.Combine(configDir, "projects", Path.GetFileName(Path.GetDirectoryName(s.Transcript)!), r.SessionId, "workflows", "scripts", Path.GetFileName(r.Script!));
+
+    /// Quiet this long, with no agent in flight, a workflow is between steps: a move then repeats nothing (trigger A).
+    public static readonly TimeSpan SafePoint = TimeSpan.FromSeconds(20);
+
+    /// Whether a window's workflows can be stopped and resumed elsewhere now (MoveWorkflows). Every run must be this session's own (resume is
+    /// same-session only), from a script on disk (a hidden one cannot resume in a new process), with no agent mid-tool or holding a background
+    /// command (never cut off: waited on, however long). Then each run is either at a safe point (A: no agent in flight, journal quiet
+    /// `SafePoint`) or held by the limit (B: every agent in flight parked at a 429).
+    public static bool Paused(StoppedSession s, DateTime nowUtc) =>
+        s.Runs is { Count: > 0 } runs && runs.All(r => Resumable(s, r) && r.Busy is not { Count: > 0 }
+            && (r.InFlight.Count == 0 ? nowUtc - r.Wrote >= SafePoint : r.InFlight.All(r.Parked.Contains)));
+
+    static bool Resumable(StoppedSession s, WorkflowRun r) => r.SessionId == s.SessionId && !r.Hidden && r.Script != null;
+
+    /// Whether a workflow run is as it was read: same journal keys, same last message from each agent in flight, still no snapshot.
+    static bool Same(WorkflowRun r) =>
+        r.Dir != null && !File.Exists(Path.Combine(r.Dir, "..", "..", "..", "workflows", r.RunId + ".json")) && ReadRun(r.SessionId, r.Dir)?.Mark == r.Mark;
+
+    /// The last user or assistant line: what a window said or was told last. Other lines (an api request, a notice) do not count.
+    static string? LastMessage(IEnumerable<string> lines)
+    {
+        foreach (var line in lines.Reverse())
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (Str(doc.RootElement, "type") is "user" or "assistant") return line;
+            }
+            catch (JsonException) { } // a line cut by the tail window, or one being written
+        return null;
+    }
 
     /// Said to a window moved while its background commands ran: they still do, so it doesn't start them twice.
     public const string Background = " Its background commands are still running.";
@@ -194,17 +239,19 @@ public static class ResumeStopped
                     }
                     var seen = File.GetLastWriteTimeUtc(t);
                     var tail = Tail(t).ToList();
+                    var said = LastMessage(tail);
                     // A limit hit only in a subagent or workflow file stops the process too, but only while the main loop has written nothing since:
                     // once it has, its own transcript says whether it stopped (a refused follow-up is an error there), else it carried on after the switch.
-                    var limit = LimitOf(tail) ?? (agentLimits?.GetValueOrDefault(id) is { } agent && seen <= agent.At.UtcDateTime && (agent.ResetsAt is not { } until || until.UtcDateTime > nowUtc) ? agent : null);
+                    var own = LimitOf(tail);
+                    var limit = own ?? (agentLimits?.GetValueOrDefault(id) is { } agent && seen <= agent.At.UtcDateTime && (agent.ResetsAt is not { } until || until.UtcDateTime > nowUtc) ? agent : null);
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail),
-                            RunningWorkflows(Path.GetDirectoryName(t)!, started)));
+                            RunningWorkflows(Path.GetDirectoryName(t)!, started), said, own != null || EndsTurn(tail)));
                     else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail),
-                            Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started)));
+                            Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started), Said: said));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
@@ -233,26 +280,7 @@ public static class ResumeStopped
                     var wrote = File.GetLastWriteTimeUtc(journal);
                     var id = Path.GetFileName(run);
                     if (wrote <= sinceUtc || File.Exists(Path.Combine(session, "workflows", id + ".json"))) continue;
-                    var hidden = false;
-                    // A resume appends to this journal: a killed agent's key is started again (new agent id). A key is done at its first result or failure.
-                    var open = new Dictionary<string, string>(); // started key -> latest agent id
-                    var done = new HashSet<string>();
-                    using (var reader = new StreamReader(new FileStream(journal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)))
-                        for (var line = reader.ReadLine(); line != null; line = reader.ReadLine())
-                            try
-                            {
-                                using var doc = JsonDocument.Parse(line);
-                                var r = doc.RootElement;
-                                switch (Str(r, "type"))
-                                {
-                                    case "launched": hidden |= r.TryGetProperty("hiddenScriptSha256", out var h) && h.ValueKind == JsonValueKind.String; break;
-                                    case "started" when Str(r, "key") is { } k && !done.Contains(k): open[k] = Str(r, "agentId") ?? ""; break;
-                                    case "result" or "failed" when Str(r, "key") is { } k: done.Add(k); open.Remove(k); break;
-                                }
-                            }
-                            catch (JsonException) { } // a line being written
-                    runs.Add(new WorkflowRun(sid, id, hidden, [.. open.Keys],
-                        [.. open.Where(a => a.Value.Length > 0 && Parked(Path.Combine(run, $"agent-{a.Value}.jsonl"))).Select(a => a.Key)]));
+                    if (ReadRun(sid, run) is { } read) runs.Add(read);
                 }
             }
         }
@@ -260,12 +288,80 @@ public static class ResumeStopped
         return runs;
     }
 
-    /// Whether a workflow agent's file ends at Claude Code's own 429: parked at a usage limit until it resets.
-    static bool Parked(string agentFile)
+    /// One run's journal: its keys in flight, which of them are parked or busy, and its `Mark`. Null when it cannot be read.
+    static WorkflowRun? ReadRun(string sid, string run)
     {
         try
         {
-            if (Tail(agentFile, 64 * 1024).LastOrDefault() is not { } last) return false;
+            var journal = Path.Combine(run, "journal.jsonl");
+            var hidden = false;
+            // A resume appends to this journal (no "resumed" line): a killed agent's key is started again (new agent id). A key is done at its first result or failure.
+            var open = new Dictionary<string, string>(); // started key -> latest agent id
+            var done = new HashSet<string>();
+            var keys = new StringBuilder();
+            using (var reader = new StreamReader(new FileStream(journal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)))
+                for (var line = reader.ReadLine(); line != null; line = reader.ReadLine())
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(line);
+                        var r = doc.RootElement;
+                        switch (Str(r, "type"))
+                        {
+                            case "launched": hidden |= r.TryGetProperty("hiddenScriptSha256", out var h) && h.ValueKind == JsonValueKind.String; break;
+                            case "started" when Str(r, "key") is { } k && !done.Contains(k): open[k] = Str(r, "agentId") ?? ""; keys.Append($"s {k} {open[k]}\n"); break;
+                            case "result" or "failed" when Str(r, "key") is { } k: done.Add(k); open.Remove(k); keys.Append($"r {k}\n"); break;
+                        }
+                    }
+                    catch (JsonException) { } // a line being written
+            var id = Path.GetFileName(run);
+            var agents = open.ToDictionary(a => a.Key, a => a.Value.Length > 0 ? AgentTail(Path.Combine(run, $"agent-{a.Value}.jsonl")) : []);
+            foreach (var a in agents) keys.Append($"a {a.Key} {LastMessage(a.Value)}\n");
+            var scripts = Path.Combine(run, "..", "..", "..", "workflows", "scripts");
+            return new WorkflowRun(sid, id, hidden, [.. open.Keys], [.. agents.Where(a => Parked(a.Value)).Select(a => a.Key)],
+                [.. agents.Where(a => MidTool(a.Value)).Select(a => a.Key)], File.GetLastWriteTimeUtc(journal),
+                Directory.Exists(scripts) ? Directory.EnumerateFiles(scripts, $"*-{id}.js").Select(Path.GetFullPath).FirstOrDefault() : null, run,
+                Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(keys.ToString()))));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// The end of a workflow agent's file; empty when it is not there yet or cannot be read.
+    static List<string> AgentTail(string agentFile)
+    {
+        try { return [.. Tail(agentFile, 64 * 1024)]; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
+    }
+
+    /// Whether an agent is mid-tool: its last message a tool call, or a background command it started (`run_in_background`) not yet
+    /// reported done. ponytail: background commands are counted against task notifications in the tail, so one older than the tail is missed.
+    static bool MidTool(List<string> lines)
+    {
+        var background = 0;
+        foreach (var line in lines)
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var r = doc.RootElement;
+                if (Str(r, "type") == "user" && IsNotice(r)) background--;
+                else if (Str(r, "type") == "assistant" && r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object
+                    && m.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.Array)
+                    background += c.EnumerateArray().Count(b => b.ValueKind == JsonValueKind.Object && Str(b, "type") == "tool_use"
+                        && b.TryGetProperty("input", out var i) && i.ValueKind == JsonValueKind.Object && i.TryGetProperty("run_in_background", out var bg) && bg.ValueKind == JsonValueKind.True);
+            }
+            catch (JsonException) { }
+        if (background > 0) return true;
+        if (LastMessage(lines) is not { } last) return false;
+        using var end = JsonDocument.Parse(last);
+        var e = end.RootElement;
+        return Str(e, "type") == "assistant" && !(e.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True) && !EndsTurn([last]);
+    }
+
+    /// Whether a workflow agent's file ends at Claude Code's own 429: parked at a usage limit until it resets.
+    static bool Parked(List<string> lines)
+    {
+        try
+        {
+            if (lines.LastOrDefault() is not { } last) return false;
             using var doc = JsonDocument.Parse(last);
             var r = doc.RootElement;
             return Str(r, "type") == "assistant" && r.TryGetProperty("isApiErrorMessage", out var e) && e.ValueKind == JsonValueKind.True
@@ -589,11 +685,15 @@ public static class ResumeStopped
 
     /// The per-window decision, in the order that keeps a window safe. `unchanged` is the last look before a close, so it runs only then.
     /// A finished turn moves only off the default login, and only after a minute without input anywhere.
-    public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged)
+    /// `moveWorkflows` (the owner's opt-in): a `cswap run` window running workflows moves once they are `Paused`, and waits until then.
+    public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged,
+        bool moveWorkflows = false, DateTime nowUtc = default)
     {
         // A workflow still running in the window would die with it: never moved; at a limit, the owner is told it stays.
-        if (s.Running) return s.AtLimit ? Step.Left : Step.Ignore;
-        if (!s.Movable) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
+        // With MoveWorkflows on, a `cswap run` window whose runs can resume elsewhere waits for them instead.
+        if (s.Running && !(moveWorkflows && s.Done && s.ConfigDir != DefaultDir && s.Runs!.All(r => Resumable(s, r)))) return s.AtLimit ? Step.Left : Step.Ignore;
+        if (s.Running && !Paused(s, nowUtc)) return Step.Wait; // an agent at work: never cut off, looked at again on the next poll
+        if (!s.Movable && !s.Running) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
         if (!s.AtLimit && (s.ConfigDir == DefaultDir || userIdle < TimeSpan.FromSeconds(60))) return Step.Ignore;
         if (s.AtLimit && userIdle < typingPause) return Step.Wait;
         if (target == null) return Step.NoRoom;
@@ -619,16 +719,19 @@ public static class ResumeStopped
     /// Whether `s` is exactly as the scan saw it: still idle, transcript untouched. Checked right before the
     /// window is closed, so a turn started (or a message sent) since the scan is never cut off, nor a recycled pid hit. A stop at a limit
     /// holds while the error is still the last message: notices Claude Code writes after it don't cancel the move.
-    public static bool Unchanged(StoppedSession s)
+    /// `workflows`: the move of a window running workflows (MoveWorkflows), judged on what was said and the runs' journals, not write times
+    /// (a live window writes request lines to its transcript all along). Without it, such a window is never unchanged: it is not `Movable`.
+    public static bool Unchanged(StoppedSession s, bool workflows = false)
     {
         try
         {
+            if (workflows && s.Running) { if (LastMessage(Tail(s.Transcript)) != s.Said || !s.Runs!.All(Same)) return false; }
             // A limit seen only in an agent file leaves the main transcript without one: it must just be as quiet as at the scan.
-            if (s.AtLimit && s.Limit is { } limit && LimitOf(Tail(s.Transcript)) is { } now ? now.At != limit.At : File.GetLastWriteTimeUtc(s.Transcript) != s.Seen) return false;
+            else if (s.AtLimit && s.Limit is { } limit && LimitOf(Tail(s.Transcript)) is { } now ? now.At != limit.At : File.GetLastWriteTimeUtc(s.Transcript) != s.Seen) return false;
             if (s.Record == null) return true;
             using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
             var r = doc.RootElement;
-            return s.Movable && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"), kill: true);
+            return (workflows && s.Running ? s.Done : s.Movable) && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"), kill: true);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
@@ -727,8 +830,8 @@ public static class ResumeStopped
     /// seals the profile's login) and the shell that held it is closed, so the window it sat in goes away. The
     /// new `cswap run` need not wait for that: it registers its run marker first, which a peer's seal respects.
     /// `record`, the killed claude's session record, is deleted once it exited: killed, Claude Code never removes it, and a
-    /// pid reused later would make it read as a live window.
-    public static async Task CloseAsync(int pid, string? record = null)
+    /// pid reused later would make it read as a live window. True once claude has exited; false when it is still there after 10 s.
+    public static async Task<bool> CloseAsync(int pid, string? record = null)
     {
         var chain = new List<(int Pid, string Name, DateTime Start)>();
         for (var (p, guard) = (pid, 0); guard < 4 && ParentOf(p) is { } parent; p = parent, guard++)
@@ -745,11 +848,13 @@ public static class ResumeStopped
         {
             claude.Kill();
             try { await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
-            catch (OperationCanceledException) { } // slow to go: the window is still reopened
-            if (record != null && claude.HasExited)
+            catch (OperationCanceledException) { } // slow to go: a window without workflows is still reopened
+            if (!claude.HasExited) return false; // its shells stay: the window is still there
+            if (record != null)
                 try { File.Delete(record); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
         _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+        return true;
     }
 
     /// Whether a shell's command line is one `Engine.LaunchConsole` started: `pwsh … -Command & '<…\cswap[.exe]>' 'run' …`
@@ -818,6 +923,20 @@ public static class ResumeStopped
             catch (ArgumentException) { } // already gone
             catch (InvalidOperationException) { }
         }
+    }
+
+    /// The close and the launch of a move, after its last look. A window running workflows (`closeFirst`) is closed first, as its runs must
+    /// stop before another window resumes them, then copied (what it wrote on the way out) and launched: the launch's answer. Any other window
+    /// gets its new one first and is closed only once that is up and `recheck` still holds: true, or null when the old one is kept.
+    /// A workflow window whose claude has not exited (`close` false) is neither copied nor launched: null, as its runs may still be going.
+    public static async Task<bool?> SwapAsync(bool closeFirst, Func<Task> copy, Func<Task<bool>> launch, Func<bool> recheck, Func<Task<bool>> close)
+    {
+        if (closeFirst && !await close()) return null;
+        try { await copy(); } catch (Exception e) { Program.Log(e); }
+        if (closeFirst) return await launch();
+        if (!await launch() || !recheck()) return null;
+        await close();
+        return true;
     }
 
     /// Whether a planned move may still close its window: the target not refused since the plan, no switch running, and the

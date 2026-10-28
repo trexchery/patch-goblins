@@ -8,7 +8,7 @@ public sealed class SettingsPanel : UserControl
     public readonly NumericUpDown SwitchBuffer = new() { Minimum = 0, Maximum = 300, Value = 0 };
     public readonly TextBox TerminalFolder = new() { PlaceholderText = "your user folder" };
     public readonly Toggle Startup = new("");
-    public readonly Toggle AutoSwitch = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new(""), Ultracode = new(""), AskApproval = new(""), AutoLine = new("");
+    public readonly Toggle AutoSwitch = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new(""), Ultracode = new(""), AskApproval = new(""), AutoLine = new(""), MoveWorkflows = new("");
     public readonly NumericUpDown AgentIssues = new() { Minimum = 0, Maximum = 10, Value = 1 }, AgentOpenPrs = new() { Minimum = 1, Maximum = 50, Value = 10 };
     public readonly TextBox Search = new() { PlaceholderText = "Search settings" };
 
@@ -54,6 +54,7 @@ public sealed class SettingsPanel : UserControl
         Row("Switch at", "When automatic is off", Threshold, Ui.S(72), "%");
         Row("Random switch delay", "0 = at once; a random wait up to this many seconds", SwitchBuffer, Ui.S(72), "s");
         Row("Auto-Prime", "Start 5-hour windows early", AutoPrime, Ui.S(34));
+        Row("Move running workflows", "Paused and resumed; agents mid-run start over", MoveWorkflows, Ui.S(34));
 
         var about = new Label
         {

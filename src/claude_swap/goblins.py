@@ -496,9 +496,10 @@ class MenuExtension:
         for key, title in (("autoPrime", "Auto-Prime"), ("autoLine", "Adaptive switch threshold"),
                            ("quotaNotifications", "Quota notifications"), ("agentDraftPrs", "Draft pull requests"),
                            ("agentUltracode", "Allow ultracode"), ("askApproval", "Ask for approvals"),
-                           ("preserveRemoteControl", "Restore Remote Control"), ("autoProjectAccount", "Prefer folder account")):
+                           ("preserveRemoteControl", "Restore Remote Control"), ("autoProjectAccount", "Prefer folder account"),
+                           ("moveWorkflows", "Move running workflows")):
             value = bool(config.get(key, key in ("autoLine", "askApproval", "preserveRemoteControl")))
-            item = rumps.MenuItem(title, callback=lambda _, k=key, v=value: self._background(lambda: self._save_setting(k, not v)))
+            item = rumps.MenuItem(title, callback=lambda _, k=key, v=value: self._toggle_setting(k, not v, config))
             item.state = int(value)
             menu.add(item)
         for key, title in (("agentIssues", "Issues at once"), ("agentOpenPrs", "Open pull request limit")):
@@ -525,6 +526,19 @@ class MenuExtension:
                 self.client.request("settings", {"values": {key: int(response.text.strip())}})
                 self._refresh()
             self._background(saved)
+
+    MOVE_WORKFLOWS_CONSENT = (
+        "Workflows running in a window at the switch line are paused and resumed on another account: at a point where no agent is "
+        "working, or once every agent waits at the limit. An agent running at the move starts over on the new account and may "
+        "repeat pushes, pull requests and file writes it already made. An agent in the middle of a tool is always waited for.")
+
+    def _toggle_setting(self, key, value, config):
+        """Saves a menu toggle; moving running workflows asks for the owner's yes once, before it first goes on."""
+        if key == "moveWorkflows" and value and not config.get("moveWorkflowsAccepted"):
+            import rumps
+            if rumps.alert(title="Move running workflows", message=self.MOVE_WORKFLOWS_CONSENT, ok="Move them", cancel="Cancel") != 1:
+                return
+        self._background(lambda: self._save_setting(key, value))
 
     def _save_setting(self, key, value):
         self.client.request("settings", {"values": {key: value}})

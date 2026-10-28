@@ -26,6 +26,29 @@ public sealed class PosixAdapterTests
         Assert.Equal(ResumeStopped.Step.Ignore, Of(idle));
         Assert.Equal(ResumeStopped.Step.Left, Of(idle with { AtLimit = true }));
         Assert.Equal(ResumeStopped.Step.Move, Of(idle with { Runs = null }));
+        // MoveWorkflows on: another session's run still never moves the window.
+        Assert.Equal(ResumeStopped.Step.Ignore, ResumeStopped.Decide(idle, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true, true, DateTime.UtcNow));
+    }
+
+    /// MoveWorkflows on macOS: the window's own run, its one agent parked at a 429, moves (BackendUpkeep.ResumeAsync then closes, copies,
+    /// launches), and the reopened window is told the script's forward-slash path in the destination profile.
+    [Fact]
+    public void APausedWorkflowMovesOnPosix()
+    {
+        using var tmp = new TempDir();
+        var project = Path.Combine(tmp.Path, "projects", "-w");
+        var run = Path.Combine(project, "sid", "subagents", "workflows", "wf_a");
+        Directory.CreateDirectory(run);
+        Directory.CreateDirectory(Path.Combine(project, "sid", "workflows", "scripts"));
+        File.WriteAllText(Path.Combine(project, "sid", "workflows", "scripts", "go-wf_a.js"), "");
+        File.WriteAllLines(Path.Combine(run, "journal.jsonl"), ["""{"type":"launched"}""", """{"type":"started","key":"k","agentId":"a","label":"x","phase":"P"}"""]);
+        File.WriteAllLines(Path.Combine(run, "agent-a.jsonl"), ["""{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{"model":"<synthetic>","role":"assistant","content":[]}}"""]);
+        var s = new StoppedSession(1, "sid", "/w", Path.Combine(tmp.Path, "profile"), 3, Path.Combine(project, "sid.jsonl"), true,
+            Runs: ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5)));
+        ResumeStopped.Step Of(bool on) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true, on, DateTime.UtcNow);
+        Assert.Equal(ResumeStopped.Step.Left, Of(false));
+        Assert.Equal(ResumeStopped.Step.Move, Of(true));
+        Assert.EndsWith("/profile2/projects/-w/sid/workflows/scripts/go-wf_a.js and resumeFromRunId wf_a.", ResumeStopped.ResumeArgs(s, Path.Combine(tmp.Path, "profile2"))[2]);
     }
 
     /// The check right before a close holds only for the process that wrote the record: a missing, unreadable or other

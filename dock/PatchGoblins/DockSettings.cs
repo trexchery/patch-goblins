@@ -26,6 +26,14 @@ public sealed class DockSettings
     public bool AutoLine { get; set; } = true; // the switch line follows each account's burn (SwitchLine); off: the engine's fixed threshold // off: agents never wait for a yes, except on files the repository's policy protects
     public DateTimeOffset? AgentSummaryAt { get; set; }
     public string? TerminalFolder { get; set; } // where "Open terminal" starts browsing; null: the user folder
+    public bool MoveWorkflows { get; set; } // a `cswap run` window running workflows moves too, paused at a safe point or at the limit (ResumeStopped.Paused)
+    public bool MoveWorkflowsAccepted { get; set; }
+
+    /// What the owner agrees to, once, before MoveWorkflows goes on.
+    public const string MoveWorkflowsConsent =
+        "Workflows running in a window at the switch line are paused and resumed on another account: at a point where no agent is " +
+        "working, or once every agent waits at the limit. An agent running at the move starts over on the new account and may " +
+        "repeat pushes, pull requests and file writes it already made. An agent in the middle of a tool is always waited for.";
 
     public const int MinRefreshSeconds = 60;
 
