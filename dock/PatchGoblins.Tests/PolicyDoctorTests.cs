@@ -176,6 +176,20 @@ public class PolicyTests
     }
 
     [Fact]
+    public void TheGuardCommandRefusesACallWheneverDecidingItFails()
+    {
+        const string Outside = """{"cwd":"C:\\wt\\k-21","tool_name":"Read","tool_input":{"file_path":"C:\\elsewhere\\x"}}""";
+        var why = new StringWriter();
+        Assert.Equal(0, Policy.Hook([@"C:\wt\k-21"], () => """{"cwd":"C:\\wt\\k-21","tool_name":"Read","tool_input":{"file_path":"a.ts"}}""", why));
+        Assert.Equal(2, Policy.Hook([@"C:\wt\k-21"], () => Outside, why));
+        // Exceptions the decision never expected (any other exit would let the tool call run).
+        Assert.Equal(2, Policy.Hook([@"C:\wt\k-21"], () => throw new IOException("stdin broke"), why));
+        Assert.Equal(2, Policy.Hook([@"C:\wt\k-21"], () => throw new PathTooLongException(), why));
+        Assert.Equal(2, Policy.Hook([@"C:\wt\k-21", ""], () => Outside, why)); // an empty folder argument: Path.GetFullPath throws in Covers
+        Assert.Contains("could not read this tool call, so it is refused", why.ToString());
+    }
+
+    [Fact]
     public void OnlyTheOwnersLocalPolicyApprovesFoldersOutsideTheWorktree()
     {
         var local = Policy.Parse("""{"addDirs":["D:\\shared\\lib"]}""", "local");

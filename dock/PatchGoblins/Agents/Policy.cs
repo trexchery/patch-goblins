@@ -259,8 +259,26 @@ public static class Policy
     /// refused too. Bash is not parsed: the owner's deny rules and auto mode's classifier cover it.
     public static int Guard(string[] roots, string input, TextWriter why) => Guard(roots, input, why, IsPosix, IsMac);
 
+    /// The `guard` command as both apps run it: anything that goes wrong while reading or deciding refuses the call (exit 2).
+    /// Any other exit, an unhandled exception's included, would let the tool call run.
+    public static int Hook(string[] roots, Func<string> read, TextWriter why)
+    {
+        try { return Guard(roots, read(), why); }
+        catch (Exception)
+        {
+            try { why.WriteLine("Patch Goblins could not read this tool call, so it is refused."); } catch (Exception) { }
+            return 2;
+        }
+    }
+
     internal static int Guard(string[] roots, string input, TextWriter why, bool posix, bool mac = false)
     {
+        // An empty root resolves to `/` on POSIX, which would let every path through: refuse instead.
+        if (roots.Length == 0 || roots.Any(string.IsNullOrWhiteSpace))
+        {
+            why.WriteLine("Patch Goblins has no folder to confine this agent to, so the call is refused.");
+            return 2;
+        }
         List<string> targets;
         try { targets = Targets(input, roots[0], Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), posix); }
         catch (Exception e) when (e is JsonException or InvalidOperationException or ArgumentException or KeyNotFoundException or NotSupportedException or IndexOutOfRangeException)

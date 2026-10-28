@@ -13,7 +13,7 @@ static class Program
         if (args is ["guard", _, ..])
         {
             using var why = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
-            Environment.ExitCode = Policy.Guard(args[1..], new StreamReader(Console.OpenStandardInput(), System.Text.Encoding.UTF8).ReadToEnd(), why);
+            Environment.ExitCode = Policy.Hook(args[1..], () => new StreamReader(Console.OpenStandardInput(), System.Text.Encoding.UTF8).ReadToEnd(), why);
             return;
         }
 
