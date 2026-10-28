@@ -132,6 +132,26 @@ def test_backend_auto_switch_setting_updates_menu_without_rewriting_backend(monk
     settings.save.assert_called_once()  # an unchanged backend snapshot does not churn the file
 
 
+def test_move_workflows_asks_once_before_it_goes_on(monkeypatch):
+    answers = []
+    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace(alert=lambda **kw: answers.pop(0)))
+    client = MagicMock()
+    client.events = queue.Queue()
+    with patch("claude_swap.goblins.BackendClient", return_value=client):
+        extension = goblins.MenuExtension()
+    extension._background = lambda work: work()
+    extension._refresh = lambda: None
+    answers.append(0)  # Cancel: nothing saved
+    extension._toggle_setting("moveWorkflows", True, {})
+    client.request.assert_not_called()
+    answers.append(1)
+    extension._toggle_setting("moveWorkflows", True, {})
+    client.request.assert_called_once_with("settings", {"values": {"moveWorkflows": True}})
+    extension._toggle_setting("moveWorkflows", True, {"moveWorkflowsAccepted": True})  # agreed before: no question
+    extension._toggle_setting("moveWorkflows", False, {})  # turning it off never asks
+    assert client.request.call_count == 3 and answers == []
+
+
 def test_terminal_command_quotes_paths_and_never_uses_shell(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

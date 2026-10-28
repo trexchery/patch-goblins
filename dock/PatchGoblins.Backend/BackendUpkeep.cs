@@ -171,13 +171,13 @@ internal sealed partial class BackendUpkeep : IDisposable
                     notify("Agents terminal stopped at a limit", $"Reopen the agents terminal in {stop.Cwd} from the Patch Goblins menu.");
                 continue;
             }
-            var target = stop.Idle ? ResumeStopped.Target(stop, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null,
+            var target = stop.Idle || settings.MoveWorkflows && stop.Running ? ResumeStopped.Target(stop, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null,
                 EffectiveThreshold, hysteresis, DateTimeOffset.UtcNow, load, limits.RefusedUntil, LiveOrLaunching(), limits.ScopedRefusedUntil,
                 line: settings.AutoLine ? a => switchLine.For(a, stop.Model) : null, followsLogins: followsLogins) : null;
             var key = $"{stop.SessionId}#{target}";
             var decision = ResumeStopped.Decide(stop, ResumeStopped.UserIdle(), TimeSpan.FromSeconds(5), target,
                 moves.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
-                ResumeStopped.MovesInLastHour(moves, stop.SessionId, DateTime.UtcNow), () => ResumeStopped.Unchanged(stop));
+                ResumeStopped.MovesInLastHour(moves, stop.SessionId, DateTime.UtcNow), () => ResumeStopped.Unchanged(stop, settings.MoveWorkflows), settings.MoveWorkflows, DateTime.UtcNow);
             if (decision != ResumeStopped.Step.Move || target is not { } number) continue;
             var account = snap.Accounts.First(a => a.Number == number);
             var destination = account.Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(number)!;
@@ -187,7 +187,7 @@ internal sealed partial class BackendUpkeep : IDisposable
             if (stop.Limit is { } old) watch.Remember(old.At);
             if (agentLimits.TryGetValue(stop.SessionId, out var agent)) watch.Remember(agent.At);
             await Task.Run(Copy); // a failed copy closes nothing
-            if (!settings.AutoSwitch || disposed || !ResumeStopped.Unchanged(stop)
+            if (!settings.AutoSwitch || disposed || !ResumeStopped.Unchanged(stop, settings.MoveWorkflows)
                 || ResumeStopped.UserIdle() < (stop.AtLimit ? TimeSpan.FromSeconds(5) : TimeSpan.FromSeconds(60))
                 || !ResumeStopped.SafeToClose(number, limits.RefusedUntil, limits.Switching || autoTask is { IsCompleted: false },
                     login.Account, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow)) continue;
@@ -198,15 +198,18 @@ internal sealed partial class BackendUpkeep : IDisposable
             moves[key] = moves[ResumeStopped.MoveStamp(stop.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
             try { ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); }
             catch (Exception error) { Program.Log(error); } // a closed session must still be reopened if this save fails
+            // A window paused with workflows running (MoveWorkflows) was closed above, before this copy: its runs resume in the new one.
+            var runs = string.Join(", ", (stop.Runs ?? []).Select(r => r.RunId));
+            if (stop.Running) Program.Log($"workflows {runs} in {Path.GetFileName(stop.Cwd.TrimEnd('/'))} paused: #{stop.Account} to #{number}");
             try
             {
                 engine.LaunchConsole($"Claude · {account.ShortName} · resumed", stop.Cwd,
-                    Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(stop)));
+                    Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(stop, stop.Running ? destination : null)));
             }
             catch (Exception error)
             {
                 Program.Log(error);
-                notify("Could not reopen a stopped window", $"In {stop.Cwd}: cswap run {number} -- --resume {stop.SessionId}");
+                notify("Could not reopen a stopped window", $"In {stop.Cwd}: cswap run {number} -- --resume {stop.SessionId}" + (stop.Running ? $" (paused workflows {runs})" : ""));
             }
             limits.Forget(stop.SessionId);
             agentLimits.Remove(stop.SessionId);

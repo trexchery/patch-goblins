@@ -176,6 +176,8 @@ internal sealed partial class BackendHost
                 case "autoSwitch": settings.AutoSwitch = property.Value.GetBoolean(); break;
                 case "autoPrime": settings.AutoPrime = property.Value.GetBoolean(); break;
                 case "autoLine": settings.AutoLine = property.Value.GetBoolean(); break;
+                // The macOS menu shows MoveWorkflowsConsent first; turning it on is the owner's yes to it.
+                case "moveWorkflows": settings.MoveWorkflows = property.Value.GetBoolean(); settings.MoveWorkflowsAccepted |= settings.MoveWorkflows; break;
                 case "autoProjectAccount": settings.AutoProjectAccount = property.Value.GetBoolean(); break;
                 case "terminalFolder": settings.TerminalFolder = property.Value.ValueKind == JsonValueKind.Null ? null : Path.GetFullPath(property.Value.GetString()!); break;
                 case "refreshSeconds": settings.RefreshSeconds = Math.Clamp(property.Value.GetInt32(), 60, 3600); break;

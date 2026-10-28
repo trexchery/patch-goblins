@@ -69,6 +69,7 @@ The terminal keeps the goblin theme, session commands, status line, and mascot p
 
 - Windows moves a window in a shell at its limit, and moves onto an account a `cswap run` window holds, then keeps the two logins in step (`follow_logins`). macOS does neither: the profile's login lives in a keychain entry only `claude` writes, so the backend's switch stays `--exclusive` and auto-switch skips a held account.
 - The backend's upkeep (`BackendUpkeep`) has no `Movable` or shell-at-limit moves and does not open the replacement window before closing the old one; that wiring exists only in the Windows `TrayApp`.
+- **Move running workflows** (Agent settings menu, off by default, asks once) works as on Windows ([agents](agents.md#resilience)): a `cswap run` window whose workflows are paused (no agent in flight for 20 s, or every agent parked at the limit, none mid-tool) is closed, copied and relaunched with a prompt naming each run's script and run id. The same order (close, copy, launch) is what Windows uses for these windows. A failed relaunch notifies with the command and the run ids.
 
 ## Build and verification
 

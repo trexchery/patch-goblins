@@ -76,6 +76,8 @@ state lives in `%LOCALAPPDATA%\patch-goblins\agents` (private to your user). eac
 
 when every account is near its limit, nothing new starts: Patch Goblins says so once, with the earliest reset, and the agents continue by themselves when an account has usage again. with **Auto-Prime** on, fresh 5-hour windows are started early while agents run, so they also reset early. once a day, from 8:00, a notification sums up what the agents did since the last one.
 
+**Move running workflows** (settings, off by default; asks once before it goes on): auto-switch normally leaves a `cswap run` window alone while a Claude Code workflow runs in it. with this on, such a window at the switch line is closed, copied and reopened on an account with room with `--resume`, and told to resume each run (`Workflow` with its `scriptPath` and `resumeFromRunId`). it moves only at a safe point (no agent in flight, the run's journal quiet for 20 seconds) or once every agent in flight is parked at the limit, and never while an agent is in the middle of a tool or has a background command open: then it waits, with no deadline. an agent caught running starts over on the new account and may repeat pushes, pull requests and file writes it already made. runs started from another session's folder or a hidden script stay where they are. a relaunch that fails says the command and the run ids.
+
 ## cost
 
 nothing runs until you first open an agents terminal. measured on the release build:
