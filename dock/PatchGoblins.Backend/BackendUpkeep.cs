@@ -193,13 +193,19 @@ internal sealed partial class BackendUpkeep : IDisposable
                     login.Account, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow)) continue;
             moves[key] = DateTime.UtcNow;
             ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); // failure here closes nothing
-            await ResumeStopped.CloseAsync(stop.Pid, stop.Record);
+            var runs = string.Join(", ", (stop.Runs ?? []).Select(r => r.RunId));
+            // A workflow window must be gone before its runs resume elsewhere: one still there after the kill is neither copied nor reopened.
+            if (!await ResumeStopped.CloseAsync(stop.Pid, stop.Record) && stop.Running)
+            {
+                Program.Log($"workflows {runs} in {Path.GetFileName(stop.Cwd.TrimEnd('/'))} not moved: the old window did not exit");
+                notify("A paused workflow's window did not close", $"Nothing was moved. Once it has exited, in {stop.Cwd}: cswap run {number} -- --resume {stop.SessionId} (paused workflows {runs})");
+                continue;
+            }
             try { await Task.Run(Copy); } catch (Exception error) { Program.Log(error); }
             moves[key] = moves[ResumeStopped.MoveStamp(stop.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
             try { ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); }
             catch (Exception error) { Program.Log(error); } // a closed session must still be reopened if this save fails
             // A window paused with workflows running (MoveWorkflows) was closed above, before this copy: its runs resume in the new one.
-            var runs = string.Join(", ", (stop.Runs ?? []).Select(r => r.RunId));
             if (stop.Running) Program.Log($"workflows {runs} in {Path.GetFileName(stop.Cwd.TrimEnd('/'))} paused: #{stop.Account} to #{number}");
             try
             {

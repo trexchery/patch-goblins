@@ -515,7 +515,7 @@ public class ResumeStoppedTests
             Assert.Equal(1, ResumeStopped.Target(s, [A(1, 20), A(3, 93)], _ => true, threshold: 90, hysteresis: 10));
             Assert.True(ResumeStopped.Unchanged(s));
 
-            await ResumeStopped.CloseAsync(s.Pid, s.Record);
+            Assert.True(await ResumeStopped.CloseAsync(s.Pid, s.Record)); // it reports the exit
             Assert.True(claude.HasExited);
             Assert.False(File.Exists(record)); // killed, Claude Code would leave it for a reused pid to revive
             ResumeStopped.CopyTranscript(s, to);
@@ -808,9 +808,9 @@ public class ResumeStoppedTests
     public async Task AWorkflowWindowIsClosedBeforeItsReplacementLaunches()
     {
         var log = new List<string>();
-        Task<bool?> Swap(bool workflows, bool launched = true, bool still = true) => ResumeStopped.SwapAsync(workflows,
+        Task<bool?> Swap(bool workflows, bool launched = true, bool still = true, bool exited = true) => ResumeStopped.SwapAsync(workflows,
             () => { log.Add("copy"); return Task.CompletedTask; }, () => { log.Add("launch"); return Task.FromResult(launched); },
-            () => { log.Add("recheck"); return still; }, () => { log.Add("close"); return Task.CompletedTask; });
+            () => { log.Add("recheck"); return still; }, () => { log.Add("close"); return Task.FromResult(exited); });
 
         Assert.True(await Swap(workflows: true));
         Assert.Equal(["close", "copy", "launch"], log);
@@ -818,11 +818,48 @@ public class ResumeStoppedTests
         Assert.False(await Swap(workflows: true, launched: false)); // the caller tells the owner the command and the run ids
         Assert.Equal(["close", "copy", "launch"], log);
         log.Clear();
+        Assert.Null(await Swap(workflows: true, exited: false)); // the killed claude is still there: its runs may be going, nothing copied or launched
+        Assert.Equal(["close"], log);
+        log.Clear();
+        Assert.True(await Swap(workflows: false, exited: false)); // a window without workflows keeps today's order: closed last, its exit not awaited
+        Assert.Equal(["copy", "launch", "recheck", "close"], log);
+        log.Clear();
         Assert.True(await Swap(workflows: false));
         Assert.Equal(["copy", "launch", "recheck", "close"], log);
         log.Clear();
         Assert.Null(await Swap(workflows: false, still: false)); // used while the new one opened: kept
         Assert.Equal(["copy", "launch", "recheck"], log);
+    }
+
+    /// A window running a background workflow keeps its record "busy" until the run settles. At its limit, with every agent parked, it still
+    /// moves once its main transcript says the turn is over; one whose main loop is mid-tool stays. Before the limit a busy window is not
+    /// a candidate at all: workflow windows move at the limit, not at trigger A, unless their record goes idle.
+    [Fact]
+    public void ABusyWorkflowWindowMovesOnlyAtItsLimitWithItsTurnOver()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var now = DateTime.UtcNow;
+            var agent = new Dictionary<string, Limit> { ["sid"] = new(null, null, now.AddSeconds(30)) }; // the parked agent's 429
+            List<StoppedSession> Scan(Dictionary<string, Limit>? limits) => ResumeStopped.Scan([(root, 3)], now.AddSeconds(60), DateTime.MinValue, includeBusy: true, agentLimits: limits);
+            ResumeStopped.Step Of(StoppedSession s) =>
+                ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, ResumeStopped.Target(s, [A(3, 98), A(4, 10)], _ => true, threshold: 90), false, 0, () => true, true, now);
+
+            Stage(root, "busy", [Typed, Done]);
+            StageResumableRun(Path.Combine(root, "projects", "C--w"), "sid", "wf_1");
+            var s = Assert.Single(Scan(agent));
+            Assert.True(s.AtLimit && s.TurnOver && s.Done && !s.Movable);
+            Assert.Equal(ResumeStopped.Step.Move, Of(s));
+            Assert.Empty(Scan(null)); // before the limit: not a candidate
+
+            Stage(root, "busy", [Typed, ToolUse]); // the main loop is in a tool of its own
+            StageResumableRun(Path.Combine(root, "projects", "C--w"), "sid", "wf_1");
+            s = Assert.Single(Scan(agent));
+            Assert.False(s.TurnOver || s.Done);
+            Assert.Equal(ResumeStopped.Step.Left, Of(s));
+        }
+        finally { Directory.Delete(root, true); }
     }
 
     [Fact]

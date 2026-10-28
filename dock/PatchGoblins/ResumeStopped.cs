@@ -12,14 +12,16 @@ namespace PatchGoblins;
 /// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
-    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null, string? Said = null)
+    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null, string? Said = null, bool TurnOver = false)
 {
     public bool Idle => Status == "idle";
     /// A workflow run is still going in the window's project folder: the window looks idle, but closing it would end the run.
     public bool Running => Runs is { Count: > 0 };
     /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
-    /// so the background command runs on to its end (the reopened window is told).
-    public bool Done => Idle || AtLimit && Status == "shell";
+    /// so the background command runs on to its end (the reopened window is told). A window running workflows keeps its record
+    /// "busy" until they settle, so at its limit "busy" counts too when the main transcript says its turn is over (`TurnOver`:
+    /// it ends at a finished reply or at its own limit error); only `Paused` then lets it move, and never before the limit.
+    public bool Done => Idle || AtLimit && (Status == "shell" || Status == "busy" && Running && TurnOver);
     /// `Done` and no workflow running. (With MoveWorkflows on, a window running one moves only once `Paused`.)
     public bool Movable => Done && !Running;
 }
@@ -240,12 +242,13 @@ public static class ResumeStopped
                     var said = LastMessage(tail);
                     // A limit hit only in a subagent or workflow file stops the process too, but only while the main loop has written nothing since:
                     // once it has, its own transcript says whether it stopped (a refused follow-up is an error there), else it carried on after the switch.
-                    var limit = LimitOf(tail) ?? (agentLimits?.GetValueOrDefault(id) is { } agent && seen <= agent.At.UtcDateTime && (agent.ResetsAt is not { } until || until.UtcDateTime > nowUtc) ? agent : null);
+                    var own = LimitOf(tail);
+                    var limit = own ?? (agentLimits?.GetValueOrDefault(id) is { } agent && seen <= agent.At.UtcDateTime && (agent.ResetsAt is not { } until || until.UtcDateTime > nowUtc) ? agent : null);
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail),
-                            RunningWorkflows(Path.GetDirectoryName(t)!, started), said));
+                            RunningWorkflows(Path.GetDirectoryName(t)!, started), said, own != null || EndsTurn(tail)));
                     else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail),
                             Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started), Said: said));
@@ -827,8 +830,8 @@ public static class ResumeStopped
     /// seals the profile's login) and the shell that held it is closed, so the window it sat in goes away. The
     /// new `cswap run` need not wait for that: it registers its run marker first, which a peer's seal respects.
     /// `record`, the killed claude's session record, is deleted once it exited: killed, Claude Code never removes it, and a
-    /// pid reused later would make it read as a live window.
-    public static async Task CloseAsync(int pid, string? record = null)
+    /// pid reused later would make it read as a live window. True once claude has exited; false when it is still there after 10 s.
+    public static async Task<bool> CloseAsync(int pid, string? record = null)
     {
         var chain = new List<(int Pid, string Name, DateTime Start)>();
         for (var (p, guard) = (pid, 0); guard < 4 && ParentOf(p) is { } parent; p = parent, guard++)
@@ -845,11 +848,13 @@ public static class ResumeStopped
         {
             claude.Kill();
             try { await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
-            catch (OperationCanceledException) { } // slow to go: the window is still reopened
-            if (record != null && claude.HasExited)
+            catch (OperationCanceledException) { } // slow to go: a window without workflows is still reopened
+            if (!claude.HasExited) return false; // its shells stay: the window is still there
+            if (record != null)
                 try { File.Delete(record); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
         _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+        return true;
     }
 
     /// Whether a shell's command line is one `Engine.LaunchConsole` started: `pwsh … -Command & '<…\cswap[.exe]>' 'run' …`
@@ -923,9 +928,10 @@ public static class ResumeStopped
     /// The close and the launch of a move, after its last look. A window running workflows (`closeFirst`) is closed first, as its runs must
     /// stop before another window resumes them, then copied (what it wrote on the way out) and launched: the launch's answer. Any other window
     /// gets its new one first and is closed only once that is up and `recheck` still holds: true, or null when the old one is kept.
-    public static async Task<bool?> SwapAsync(bool closeFirst, Func<Task> copy, Func<Task<bool>> launch, Func<bool> recheck, Func<Task> close)
+    /// A workflow window whose claude has not exited (`close` false) is neither copied nor launched: null, as its runs may still be going.
+    public static async Task<bool?> SwapAsync(bool closeFirst, Func<Task> copy, Func<Task<bool>> launch, Func<bool> recheck, Func<Task<bool>> close)
     {
-        if (closeFirst) await close();
+        if (closeFirst && !await close()) return null;
         try { await copy(); } catch (Exception e) { Program.Log(e); }
         if (closeFirst) return await launch();
         if (!await launch() || !recheck()) return null;

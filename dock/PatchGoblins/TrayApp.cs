@@ -542,7 +542,12 @@ public sealed partial class TrayApp : ApplicationContext
             if (s.Running)
             {
                 var runs = string.Join(", ", s.Runs!.Select(r => r.RunId));
-                Program.Log($"workflows {runs} in {folder} paused: #{s.Account} to #{account.Number}{(swapped == true ? "" : ", relaunch failed")}");
+                Program.Log($"workflows {runs} in {folder} paused: #{s.Account} to #{account.Number}{(swapped == true ? "" : swapped == null ? ", old window did not exit" : ", relaunch failed")}");
+                if (swapped == null)
+                {
+                    Notify("A paused workflow's window did not close", $"Nothing was moved. Once it has exited, in {s.Cwd}: cswap run {account.Number} -- --resume {s.SessionId} (paused workflows {runs})", ToolTipIcon.Warning);
+                    return null;
+                }
                 if (swapped != true)
                 {
                     Notify("Could not reopen a paused workflow", $"Run {runs} again in {s.Cwd}: cswap {string.Join(' ', args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a))}", ToolTipIcon.Warning);
