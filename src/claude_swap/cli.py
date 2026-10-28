@@ -685,6 +685,15 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Minimum time between proactive switches (default 300)",
     )
     parser.add_argument(
+        "--switch-buffer",
+        type=int,
+        metavar="SECONDS",
+        help=(
+            "Wait a random 0-N seconds before a proactive switch "
+            "(default 0; at-limit and failover switches never wait)"
+        ),
+    )
+    parser.add_argument(
         "--model",
         metavar="NAMES",
         help=(

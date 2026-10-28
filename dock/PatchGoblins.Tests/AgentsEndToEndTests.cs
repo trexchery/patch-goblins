@@ -44,8 +44,11 @@ public sealed class AgentsEndToEndTests : IDisposable
         _repo = NewRepo("repo");
         var fakes = Path.Combine(AppContext.BaseDirectory, "fakes");
         // Well inside Until's 90 s: a hung fake gh is killed and logged, and Until's failure prints patch-goblins.log.
-        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd")) { GhTimeout = TimeSpan.FromSeconds(30) };
-        _engine = new Engine(Path.Combine(fakes, "cswap.cmd"));
+        if (!OperatingSystem.IsWindows())
+            foreach (var fake in new[] { "gh.sh", "cswap.sh" })
+                File.SetUnixFileMode(Path.Combine(fakes, fake), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        _cli = new Cli(Engine.FindOnPath(OperatingSystem.IsWindows() ? "git.exe" : "git")!, Path.Combine(fakes, OperatingSystem.IsWindows() ? "gh.cmd" : "gh.sh")) { GhTimeout = TimeSpan.FromSeconds(30) };
+        _engine = new Engine(Path.Combine(fakes, OperatingSystem.IsWindows() ? "cswap.cmd" : "cswap.sh"));
         _store = new AgentStore(P("agents"));
     }
 
@@ -123,7 +126,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         while (!await On(r => { try { return condition(r); } catch (InvalidOperationException) { return false; } }, repo))
         {
             if (DateTime.UtcNow > until)
-                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))), repo)}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
+                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))), repo)}\nsupervisor: {await _loop.Run(() => _sup!.Diagnose())}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
             await Task.Delay(200);
         }
     }
@@ -213,7 +216,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         // A work run, then a fresh review run; never the signed-in account, never without isolation.
         Assert.Equal(2, Runs.Length);
         Assert.All(Runs, r => Assert.StartsWith("run 2 --require-session -- -p", r));
-        Assert.DoesNotContain("Edit", Runs[0]);
+        Assert.DoesNotContain("Edit Write NotebookEdit", Runs[0]);
         Assert.Contains("Edit Write NotebookEdit", Runs[1]);
         Assert.All(Read(_log + ".env").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), l => Assert.Equal("patch-goblins-agent-has-no-github-access|file|", l));
         Assert.Contains(_notes, n => n.StartsWith("Pull request ready"));
@@ -333,7 +336,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.True(Directory.Exists(moved));
         Assert.Equal(moved, await On(r => Item(r, 10).Worktree));
         // git learns the worktree's new place, so no prune drops it with its work.
-        await AgentProcessTests.WaitUntil(() => Git(_repo, "worktree", "list", "--porcelain").Replace('/', '\\').Contains(moved, StringComparison.OrdinalIgnoreCase));
+        await AgentProcessTests.WaitUntil(() => Git(_repo, "worktree", "list", "--porcelain").Replace('\\', '/').Contains(moved.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
 
         File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
         await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
@@ -397,7 +400,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     {
         Issues("""[{"number":30,"title":"Fragile","body":"[fake:break] [fake:review-changes] Careful.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         await StartAsync();
-        await Tool("agents_control", """{"action":"start","verify":"if exist broken.txt (exit 1) else (exit 0)"}""");
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? "if exist broken.txt (exit 1) else (exit 0)" : "test ! -f broken.txt" }));
         await Until(r => Item(r, 30).State == ItemState.Open, "the item passes verification and review");
         var prompts = Read(_log + ".prompts");
         Assert.Contains("and it failed", prompts);
@@ -405,12 +408,12 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("the greeting has no test", prompts);
         // work, (verify fails) resume, review → changes, resume, review → approved
         Assert.Equal(5, Runs.Length);
-        Assert.Equal(3, Runs.Count(r => !r.Contains("NotebookEdit")));
+        Assert.Equal(3, Runs.Count(r => !r.Contains("Edit Write NotebookEdit")));
         Assert.Equal(2, Runs.Count(r => r.Contains("--resume")));
         Assert.False(File.Exists(Path.Combine(await On(r => Item(r, 30).Worktree!), "broken.txt")));
         // Unrouted, it runs on the default route. One failed verification may be a flake: the same route resumes.
         // The review's findings are a genuine failure: the fix pass gets the stronger model, same effort, same conversation.
-        var work = Runs.Where(r => !r.Contains("NotebookEdit")).ToArray();
+        var work = Runs.Where(r => !r.Contains("Edit Write NotebookEdit")).ToArray();
         Assert.All(work[..2], r => Assert.Contains("--model sonnet --effort medium", r));
         Assert.Contains("--model opus --effort medium", work[2]);
         Assert.Contains("--resume", work[2]);
@@ -446,7 +449,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("Capacity:", director);
         // The triage plans nothing and is read-only, without workflows; the work run uses its route, the reviewer is never Haiku.
         Assert.Equal(2, await On(r => r.Items.Count));
-        Assert.Contains("NotebookEdit", Runs[0]);
+        Assert.Contains("Edit Write NotebookEdit", Runs[0]);
         Assert.Contains("--model sonnet --effort high", Runs[0]); // routing the backlog spends no Opus
         Assert.Contains("\"ultracode\":false", Runs[0]);
         Assert.Contains("issue #41", Read(_log + ".prompts").Split("---- account")[2]);
@@ -677,7 +680,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Issues("""[{"number":63,"title":"Small","body":"Polish.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         var ready = P("ready");
         await StartAsync();
-        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist \"{ready}\" (exit 0) else (ping -n 120 127.0.0.1 >nul)" }));
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (ping -n 120 127.0.0.1 >nul)" : $"test -f '{ready}' || sleep 120" }));
         await Task.Delay(3000); // the baseline check is under way (or about to be)
         await Terminal(open: false);
         await Task.Delay(3000);
@@ -757,7 +760,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var verifying = P("verifying");
         await StartAsync();
         // Passes on main (the baseline); in the item's worktree it hangs until something stops it.
-        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist issue-90.txt (type nul > \"{verifying}\" & ping -n 120 127.0.0.1 >nul) else (exit 0)" }));
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = OperatingSystem.IsWindows() ? $"if exist issue-90.txt (type nul > \"{verifying}\" & ping -n 120 127.0.0.1 >nul) else (exit 0)" : $"if test -f issue-90.txt; then touch '{verifying}'; sleep 120; fi" }));
         await AgentProcessTests.WaitUntil(() => File.Exists(verifying));
         var wt = await On(r => Item(r, 90).Worktree!);
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#90"}"""));
@@ -970,7 +973,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     public async Task AClaimIsRefutedByAFailingCheckThenAchievedOnceItPasses()
     {
         var ready = P("ready");
-        var check = $"if exist \"{ready}\" (exit 0) else (exit 1)";
+        var check = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (exit 1)" : $"test -f '{ready}'";
         Plan("""{"status":"achieved","summary":"already there","evidence":"it already works"}""");
         Plan("""{"status":"achieved","summary":"ready now","evidence":"ready is in place"}""");
         var since = DateTimeOffset.Now;
@@ -992,6 +995,165 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("1 goal achieved", await _loop.Run(() => _sup!.Summary(since)));
         Assert.Contains("Goal g1 Be ready: achieved: ready is in place", await Tool("agents_status", "{}"));
         _sup!.Dispose();
+    }
+
+    /// Cleanup that fails (git throws or hangs while removing the planner's or the check's checkout; an antivirus-style hold on a
+    /// file in the check's run folder) must never leave the goal busy: the plan is still judged, the claim still checked, the next plan still launched.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFailingCleanupOfAProbeCheckoutDoesNotStrandTheGoal(bool hang)
+    {
+        var ready = P("ready");
+        var check = OperatingSystem.IsWindows() ? $"if exist \"{ready}\" (exit 0) else (exit 1)" : $"test -f '{ready}'";
+        Plan("""{"status":"achieved","summary":"already there","evidence":"it already works"}""");
+        Plan("""{"status":"achieved","summary":"ready now","evidence":"ready is in place"}""");
+        var config = GoalConfig(TimeSpan.FromSeconds(8));
+        config.ProbeCleanup = TimeSpan.FromSeconds(1);
+        string? held = null;
+        var removals = 0;
+        await StartAsync(config);
+        await _loop.Run(() =>
+        {
+            _sup!.BeforeProbeRemoval = probe =>
+            {
+                removals++;
+                if (hang) return new TaskCompletionSource().Task; // git hangs
+                if (probe.Id.StartsWith("goal-") && held == null)
+                {
+                    // A read-only file in the check's run folder: deleting the folder throws UnauthorizedAccessException.
+                    var dir = Path.Combine(_store.RunDir(_sup.RepoFor(_repo)!, probe), "held");
+                    Directory.CreateDirectory(dir);
+                    File.WriteAllText(Path.Combine(dir, "x"), "");
+                    if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.ReadOnly);
+                    else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                    held = dir;
+                }
+                throw new InvalidOperationException("git could not start");
+            };
+            return 0;
+        });
+        try
+        {
+            await Tool("agents_control", """{"action":"start"}""");
+            await Goal(new { action = "set", title = "Be ready", checks = new[] { check } });
+
+            await Until(r => G(r).Refuted?.Contains("failed on main") == true, "the check ran although the planner's cleanup failed", seconds: 45);
+            File.WriteAllText(ready, "");
+            await Until(r => G(r).State == GoalState.Achieved, "the next plan launched and its claim passed although cleanups failed", seconds: 45);
+            Assert.True(removals >= 4, $"{removals} probe removals: two plans and two checks");
+        }
+        finally
+        {
+            _sup!.Dispose();
+            if (held != null)
+            {
+                if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(held, "x"), FileAttributes.Normal);
+                else File.SetUnixFileMode(held, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
+
+    /// Read-only file in a probe's run folder: deleting the folder throws UnauthorizedAccessException.
+    static string Hold(string runDir)
+    {
+        var dir = Path.Combine(runDir, "held");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "x"), "");
+        if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.ReadOnly);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        return dir;
+    }
+
+    static void Release(string dir)
+    {
+        if (OperatingSystem.IsWindows()) File.SetAttributes(Path.Combine(dir, "x"), FileAttributes.Normal);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
+    /// The baseline check's cleanup (its checkout, its run folder) that fails must not leave the repository "baselining" for good: the work still dispatches.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFailingCleanupOfTheBaselineCheckoutStillLetsTheRepositoryDispatch(bool hang)
+    {
+        Issues("""[{"number":64,"title":"Small","body":"Polish.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var config = Fast();
+        config.ProbeCleanup = TimeSpan.FromSeconds(1);
+        string? held = null;
+        var removals = 0;
+        await StartAsync(config);
+        await _loop.Run(() =>
+        {
+            _sup!.BeforeProbeRemoval = probe =>
+            {
+                if (probe.Id != "baseline") return Task.CompletedTask;
+                removals++;
+                if (hang) return new TaskCompletionSource().Task; // git hangs
+                held ??= Hold(_store.RunDir(_sup.RepoFor(_repo)!, probe)); // and the run folder cannot be deleted either
+                throw new InvalidOperationException("git could not start");
+            };
+            return 0;
+        });
+        try
+        {
+            await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+            await Until(r => Item(r, 64).State == ItemState.Open, "the repository dispatches although the baseline's cleanup failed", seconds: 45);
+            Assert.True(removals >= 1);
+        }
+        finally
+        {
+            _sup!.Dispose();
+            if (held != null) Release(held);
+        }
+    }
+
+    /// FinishAsync's run-folder delete that hits a read-only file must not throw: the skip still completes, the item goes, work moves on.
+    [Fact]
+    public async Task AHeldRunFolderDoesNotStopAnItemFromFinishing()
+    {
+        Issues("""
+            [{"number":70,"title":"Skip me","body":"[fake:long]","labels":[],"assignees":[],"author":{"login":"owner"}},
+             {"number":71,"title":"Next","body":"[fake:long]","labels":[],"assignees":[],"author":{"login":"owner"}}]
+            """);
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 70).Run is { Pid: > 0 } && Runs.Length == 1, "the first run starts");
+        var pid = await On(r => Item(r, 70).Run!.Pid);
+        var held = Hold(await _loop.Run(() => _store.RunDir(_sup!.RepoFor(_repo)!, Item(_sup.RepoFor(_repo)!, 70))));
+        try
+        {
+            Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#70"}"""));
+            await Until(r => r.Items.All(i => i.Issue != 70) && Item(r, 71).Run is { Pid: > 0 } && Runs.Length == 2, "work moves on to the next issue");
+            await Gone(pid);
+            Assert.True(Directory.Exists(held)); // left for the next run to replace, not deleted and not thrown
+        }
+        finally
+        {
+            _sup!.Dispose();
+            Release(held);
+        }
+    }
+
+    [Fact]
+    public void ADirectoryAnotherProgramHoldsIsLeftBehindWithoutThrowing()
+    {
+        var dir = P("held");
+        var file = Path.Combine(dir, "x");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(file, "");
+        if (OperatingSystem.IsWindows()) File.SetAttributes(file, FileAttributes.ReadOnly);
+        else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            Supervisor.TryDeleteDirectory(dir);
+            Assert.True(File.Exists(file)); // not deleted, and no exception: UnauthorizedAccessException is as transient as IOException
+        }
+        finally
+        {
+            if (OperatingSystem.IsWindows()) File.SetAttributes(file, FileAttributes.Normal);
+            else File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
     }
 
     [Fact]
@@ -1141,7 +1303,8 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("\"os\"", refused);
         Assert.False(await On(r => r?.Authorized ?? false));
         // Marked for the system it was written for, it is skipped here, as policy checks for another system always were.
-        CommitPolicy("""{"version":1,"checks":[{"run":"CI=1 git --version","os":"linux"}]}""");
+        var foreignOs = OperatingSystem.IsLinux() ? "macos" : "linux";
+        CommitPolicy(JsonSerializer.Serialize(new { version = 1, checks = new[] { new { run = "CI=1 git --version", os = foreignOs } } }));
         Assert.StartsWith("Nothing started: The command `export CI=1", await Tool("agents_control", """{"action":"start","verify":"export CI=1 && git --version"}"""));
         Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start","verify":"set CI=1&& git --version"}"""));
         _sup!.Dispose();
@@ -1443,7 +1606,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => G(r).Plans == 1, "the plan comes from another account");
         Assert.StartsWith("run 2 ", Runs[0]);
         Assert.StartsWith("run 3 ", Runs[1]);
-        Assert.All(Runs[..2], r => Assert.Contains("NotebookEdit", r));
+        Assert.All(Runs[..2], r => Assert.Contains("Edit Write NotebookEdit", r));
         Assert.Equal(0, await On(r => G(r).Failures)); // a limit is not the plan's fault
         _sup!.Dispose();
     }
@@ -1451,7 +1614,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     [Fact]
     public async Task AHungGhCallIsKilledAndLoggedAtItsTimeout()
     {
-        var hung = new Cli(_cli.Git, Engine.FindOnPath("powershell.exe")!) { GhTimeout = TimeSpan.FromSeconds(1) };
+        var hung = new Cli(_cli.Git, Engine.FindOnPath(OperatingSystem.IsWindows() ? "powershell.exe" : "pwsh")!) { GhTimeout = TimeSpan.FromSeconds(1) };
         var r = await hung.GhAsync(_repo, "-NoProfile", "-Command", "Start-Sleep 60");
         Assert.Equal(124, r.Code);
         Assert.Contains("timed out after 1 s", Read(Path.Combine(P("data"), "patch-goblins.log")));
@@ -1469,18 +1632,19 @@ public sealed class AgentsEndToEndTests : IDisposable
     [Fact]
     public async Task ASensitiveChangeGetsAnAdversarialReviewAndWaitsForTheOwnerEvenAcrossARestart()
     {
-        CommitPolicy("""{"version":1,"sensitive":["deploy/**"],"checks":[{"run":"git --version","paths":["issue-*.txt"]},{"run":"exit 1","paths":["never/**"]},{"run":"exit 1","os":"linux"}]}""");
+        var foreignOs = OperatingSystem.IsLinux() ? "macos" : "linux";
+        CommitPolicy("""{"version":1,"sensitive":["deploy/**"],"checks":[{"run":"git --version","paths":["issue-*.txt"]},{"run":"exit 1","paths":["never/**"]},{"run":"exit 1","os":"OTHER_OS"}]}""".Replace("OTHER_OS", foreignOs));
         Issues("""[{"number":50,"title":"Deploy script","body":"[fake:touch=deploy/run.txt] Add it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         await StartAsync();
         string? shown = null;
         await _loop.Run(() => { _sup!.Authorize = (_, v, _) => { shown = v; return Task.FromResult(true); }; return 0; });
         Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
-        Assert.Equal("`git --version` when issue-*.txt change\n`exit 1` when never/** change\n`exit 1` (linux only)", shown); // the owner confirms the policy's checks
+        Assert.Equal($"`git --version` when issue-*.txt change\n`exit 1` when never/** change\n`exit 1` ({foreignOs} only)", shown); // the owner confirms the policy's checks
 
         await Until(r => Item(r, 50) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the sensitive change waits for the owner");
         Assert.DoesNotContain("patch-goblins/50", Git(_repo, "ls-remote", "origin"));
         Assert.Contains("deploy/run.txt", await On(r => Item(r, 50).Note!));
-        Assert.Contains("--model opus --effort high", Runs.Single(r => r.Contains("NotebookEdit")));
+        Assert.Contains("--model opus --effort high", Runs.Single(r => r.Contains("Edit Write NotebookEdit")));
         var review = Read(_log + ".prompts").Split("---- account").Single(p => p.Contains("You are reviewing"));
         Assert.Contains("Review them adversarially", review);
         Assert.Contains("deploy/run.txt", review);
@@ -1496,7 +1660,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 50).State == ItemState.Open, "the owner's yes pushes it");
         var body = Read(Path.Combine(_gh, "pr-body-7.md"));
         Assert.Contains("passed: `git --version` at", body); // selected by the changed paths
-        Assert.Contains("not run here: `exit 1` needs linux", body); // covers the change, but proves nothing here
+        Assert.Contains($"not run here: `exit 1` needs {foreignOs}", body); // covers the change, but proves nothing here
         Assert.DoesNotContain("never/**", body);
         Assert.Contains("pushed with the owner's approval", body);
 
@@ -1519,7 +1683,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("tells GitHub to skip CI", Read(_log + ".prompts"));
         Assert.False(PatchGoblins.Policy.SkipsCi(Git(await On(r => Item(r, 51).Worktree!), "log", "--format=%B", "origin/main..HEAD")));
         Assert.DoesNotContain("patch-goblins/51", Git(_repo, "ls-remote", "origin"));
-        Assert.All(Runs.Where(r => !r.Contains("NotebookEdit")), r => Assert.Contains("Bash(ddc *)", r));
+        Assert.All(Runs.Where(r => !r.Contains("Edit Write NotebookEdit")), r => Assert.Contains("Bash(ddc *)", r));
         _sup!.Dispose();
     }
 
@@ -1652,7 +1816,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "push" }, "the push waits for the owner");
         var wt = await On(r => Item(r, 52).Worktree!);
         var seen = Git(wt, "rev-parse", "HEAD");
-        Assert.Single(Runs, r => r.Contains("NotebookEdit"));
+        Assert.Single(Runs, r => r.Contains("Edit Write NotebookEdit"));
 
         // Before the owner answers, the branch changes: the CI workflow moves away and another arrives under a name git quotes.
         Git(wt, "mv", ".github/workflows/ci.yml", "ci.yml.off");
@@ -1664,7 +1828,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         // The yes was for the commit the owner saw: the new one is reviewed again, adversarially, and waits again.
         await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the new commit waits for the owner");
         Assert.DoesNotContain("patch-goblins/52", Git(_repo, "ls-remote", "origin"));
-        Assert.Equal(2, Runs.Count(r => r.Contains("NotebookEdit")));
+        Assert.Equal(2, Runs.Count(r => r.Contains("Edit Write NotebookEdit")));
         var note = await On(r => Item(r, 52).Note!);
         Assert.Contains(".github/workflows/ci.yml", note);
         Assert.Contains("déploy.yml", note);

@@ -103,7 +103,7 @@ public class AgentsLiveTests(ITestOutputHelper output)
         File.WriteAllText(f($"prompt-{n}.md"), prompt);
         var (outPath, errPath) = (f($"out-{n}.jsonl"), f($"err-{n}.log"));
         var started = Stopwatch.StartNew();
-        using var p = AgentProcess.Start(engine, Supervisor.WorkerArgs(int.Parse(account), session, resume, review: false, settings), work,
+        using var p = AgentProcess.Start(engine, Supervisor.WorkerArgs(int.Parse(account), session, resume, review: false, work, settings), work,
             $@"Local\patch-goblins-live-{Guid.NewGuid():N}", f($"prompt-{n}.md"), outPath, errPath, Supervisor.WorkerEnvironment(f("no-gh"), settings));
         // Completion as the supervisor judges it: the stream's final answer, nothing pending, quiet for FinishGrace.
         var config = new AgentsConfig();
@@ -179,7 +179,7 @@ public class AgentsLiveTests(ITestOutputHelper output)
     {
         File.WriteAllText(f($"prompt-{n}.md"), prompt);
         var started = Stopwatch.StartNew();
-        using var p = AgentProcess.Start(engine, Supervisor.WorkerArgs(int.Parse(account), session, resume, review: false), work,
+        using var p = AgentProcess.Start(engine, Supervisor.WorkerArgs(int.Parse(account), session, resume, review: false, work), work,
             $@"Local\patch-goblins-live-{Guid.NewGuid():N}", f($"prompt-{n}.md"), f($"out-{n}.jsonl"), f($"err-{n}.log"), Supervisor.WorkerEnvironment(f("no-gh")));
         await p.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(4));
         var events = StreamTail.ReadAll(f($"out-{n}.jsonl"));

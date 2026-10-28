@@ -659,8 +659,28 @@ public class EngineIntegrationTests
     }
 }
 
-public class RenderTests
+/// What the render tests pin about the machine they run on, so they prove the same thing on any display. A small CI screen
+/// would otherwise cap the flyout at 80% of its height; other scales and a missing Segoe UI change every measured size.
+/// To see how the layout holds elsewhere, set PG_TEST_WORKAREA_HEIGHT (default 1080 at 100%, scaled up with PG_TEST_SCALE), PG_TEST_SCALE (default: the display's)
+/// and PG_TEST_FONT (default: Segoe UI; a name that is not installed shows the fallback font) before running.
+static class RenderPins
 {
+    // A property, not a field: reading Ui before PinUi has run would fix its scale.
+    internal static int WorkAreaHeight => int.TryParse(Environment.GetEnvironmentVariable("PG_TEST_WORKAREA_HEIGHT"), out var h) ? h : Ui.S(1080); // 1080 px at 100%, the screen of a bigger display at higher scales
+
+    // Ui reads these once, the first time anything touches it: before any test runs.
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void PinUi()
+    {
+        if (float.TryParse(Environment.GetEnvironmentVariable("PG_TEST_SCALE"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var s)) UiPins.Scale = s;
+        if (Environment.GetEnvironmentVariable("PG_TEST_FONT") is { Length: > 0 } f) UiPins.Family = f;
+    }
+}
+
+public class RenderTests(Xunit.Abstractions.ITestOutputHelper output)
+{
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+
     static IEnumerable<Control> All(Control c) => c.Controls.Cast<Control>().SelectMany(x => All(x).Prepend(x));
 
     static List<string> SectionLabels(Control c) =>
@@ -668,6 +688,82 @@ public class RenderTests
 
     static IEnumerable<AccountRow> FindRows(Control c) =>
         c.Controls.Cast<Control>().SelectMany(x => x is AccountRow r ? [r] : FindRows(x));
+
+    // ---- Failures that identify themselves ----
+
+    /// The machine's real display, fonts and session, in every failure and in the test output: a CI failure that
+    /// cannot be reproduced still says what the runner looked like.
+    static string Describe()
+    {
+        static string Try(Func<object?> f) { try { return Convert.ToString(f(), System.Globalization.CultureInfo.InvariantCulture) ?? "null"; } catch (Exception e) { return e.GetType().Name; } }
+        using var body = Ui.Font(9f);
+        using var semibold = Ui.Font(9f, semibold: true);
+        return $"screen work={Try(() => Screen.PrimaryScreen?.WorkingArea)} bounds={Try(() => Screen.PrimaryScreen?.Bounds)} screens={Try(() => Screen.AllScreens.Length)}"
+            + $" | dpi={Try(() => { using var g = Graphics.FromHwnd(IntPtr.Zero); return g.DpiX; })} Ui.Scale={Ui.Scale}"
+            + $" | font={body.Name}/{semibold.Name} default={SystemFonts.DefaultFont.Name} segoeUi={Try(() => FontFamily.Families.Any(f => f.Name == "Segoe UI"))}"
+            + $" | interactive={Environment.UserInteractive} session={Try(() => SystemInformation.TerminalServerSession)} cursor={Try(() => Cursor.Position)} os={Environment.OSVersion.Version}"
+            + $" | pinned workArea={RenderPins.WorkAreaHeight} scale={UiPins.Scale?.ToString() ?? "-"} font={UiPins.Family ?? "-"}";
+    }
+
+    string _env = "";
+
+    static string Show(object? o) => o switch
+    {
+        null => "null",
+        string s => $"\"{s}\"",
+        System.Collections.IEnumerable e => "[" + string.Join(", ", e.Cast<object?>().Select(Show)) + "]",
+        _ => Convert.ToString(o, System.Globalization.CultureInfo.InvariantCulture) ?? "",
+    };
+
+    Xunit.Sdk.XunitException Fail(string what) => new($"{what} [{_env}]");
+    void True(bool ok, string what) { if (!ok) throw Fail(what); }
+    void Eq<T>(T expected, T actual, string what) { if (!Same(expected, actual)) throw Fail($"{what}: expected {Show(expected)}, got {Show(actual)}"); }
+    void InRange(int actual, int low, int high, string what) { if (actual < low || actual > high) throw Fail($"{what}: {actual} is outside {low}..{high}"); }
+
+    static bool Same<T>(T a, T b)
+    {
+        try { Assert.Equal(a, b); return true; } catch (Xunit.Sdk.XunitException) { return false; }
+    }
+
+    /// Pumps messages until `done`, to a generous deadline: a loaded runner is slow, never wrong.
+    static bool Until(Func<bool> done, int ms = 15000)
+    {
+        var end = Environment.TickCount64 + ms;
+        for (Application.DoEvents(); !done(); Application.DoEvents())
+        {
+            if (Environment.TickCount64 > end) return false;
+            Thread.Sleep(5);
+        }
+        return true;
+    }
+
+    /// WinForms needs an STA thread. The body's failure comes back with its own stack (a bare `throw failure` would
+    /// reset it to this line), after the machine's facts went to the test output.
+    void Sta(Action body)
+    {
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                _env = Describe();
+                output.WriteLine(_env);
+                body();
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    /// An off-screen flyout on a pinned work area. Holding it open stops another window taking focus (the runner's own
+    /// console, a test host) from hiding it halfway; hiding on losing focus is not what these tests are about.
+    static DashboardForm NewForm(int? workAreaHeight = null) =>
+        new() { WorkAreaHeight = workAreaHeight ?? RenderPins.WorkAreaHeight, Location = new Point(-10000, -10000), HoldOpen = 1 };
+
+    // ---- The tests ----
 
     /// Smoke test: the dashboard lays out a realistic snapshot without throwing.
     /// Set DOCK_RENDER_OUT=<file.png> to also save what it drew.
@@ -689,132 +785,161 @@ public class RenderTests
             ["work@example.com|"] = new(JobKind.Yours, "yours · signed in"),
             ["side@example.com|"] = new(JobKind.Idle, "sitting out"),
         };
-        Exception? failure = null;
-        var t = new Thread(() =>
+        void RowsAre(DashboardForm form, int height, string what)
         {
-            try
+            var heights = FindRows(form).Select(r => r.Height).ToList();
+            True(heights.Count == 3 && heights.All(h => h == height), $"{what}: row heights {Show(heights)}, expected three of {height}");
+        }
+        Sta(() =>
+        {
+            using var form = NewForm();
+            form.Render(snap, null, null, null, jobs);
+            form.SetStatus("12:00");
+            Eq("", form.StatusText, "a refresh time is not news: the header says nothing until the team does");
+            form.SetTeam("1 working · 1 resting");
+            Eq("1 working · 1 resting", form.StatusText, "the team's line shows");
+            form.SetStatus(DashboardForm.Updating);
+            Eq("1 working · 1 resting", form.StatusText, "updating does not replace the team's line");
+            form.SetStatus(DashboardForm.Offline);
+            Eq("offline", form.StatusText, "offline outranks the team's line");
+            form.SetStatus("12:00");
+            form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
+            form.Show();
+            True(Until(() => form.Visible && IsWindowVisible(form.Handle)), "the flyout never showed");
+            using var bmp = new Bitmap(form.Width, form.Height);
+            form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
+            InRange(form.Height, Ui.S(200), Ui.S(360), "three slim rows, not cards: flyout height");
+            output.WriteLine($"measured: three rows {form.Height} (allowed {Ui.S(200)}..{Ui.S(360)})");
+            RowsAre(form, Ui.S(68), "each goblin's job line makes its row a line taller");
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
+            Eq(["TEAM"], SectionLabels(form), "no visitors: just the team");
+
+            form.Render(snap, null);
+            Application.DoEvents();
+            RowsAre(form, Ui.S(52), "no job to show: the slim row");
+
+            var codex = new Snapshot(1, 1, [new Account(1, "dev@example.com", true, "ok", new Usage(W(40, 3), W(10, 90), null, null)) { Provider = "codex" }]);
+            form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")], null, jobs);
+            Application.DoEvents();
+            Eq(["TEAM", "+ VISITORS · CODEX · GROK"], SectionLabels(form), "visitors stay closed until clicked");
+            Eq(0, FindRows(form).Count(r => r.Account.Provider != "claude"), "closed visitors list no rows");
+            var closedHeight = form.Height;
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_PROVIDERS_OUT") is { Length: > 0 } pOut)
             {
-                using var form = new DashboardForm();
-                form.Render(snap, null, null, null, jobs);
-                form.SetStatus("12:00");
-                Assert.Equal("", form.StatusText); // a refresh time is not news: the header says nothing until the team does
-                form.SetTeam("1 working · 1 resting");
-                Assert.Equal("1 working · 1 resting", form.StatusText);
-                form.SetStatus(DashboardForm.Updating);
-                Assert.Equal("1 working · 1 resting", form.StatusText);
-                form.SetStatus(DashboardForm.Offline);
-                Assert.Equal("offline", form.StatusText);
-                form.SetStatus("12:00");
-                form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
-                form.Show();
-                Application.DoEvents();
-                using var bmp = new Bitmap(form.Width, form.Height);
-                form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                Assert.InRange(form.Height, Ui.S(200), Ui.S(360)); // three slim rows, not cards
-                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(68), r.Height)); // each goblin's job line makes its row a line taller
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
-                Assert.Equal(["TEAM"], SectionLabels(form)); // no visitors: just the team
-
-                form.Render(snap, null);
-                Application.DoEvents();
-                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(52), r.Height)); // no job to show: the slim row
-
-                var codex = new Snapshot(1, 1, [new Account(1, "dev@example.com", true, "ok", new Usage(W(40, 3), W(10, 90), null, null)) { Provider = "codex" }]);
-                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")], null, jobs);
-                Application.DoEvents();
-                Assert.Equal(["TEAM", "+ VISITORS · CODEX · GROK"], SectionLabels(form)); // visitors stay closed until clicked
-                Assert.Empty(FindRows(form).Where(r => r.Account.Provider != "claude"));
-                var closedHeight = form.Height;
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_PROVIDERS_OUT") is { Length: > 0 } pOut)
-                {
-                    form.Shimmer(-1); // the Agents button's glint sweeps for the first moments: a still frame
-                    using var pb = new Bitmap(form.Width, form.Height);
-                    form.DrawToBitmap(pb, new Rectangle(0, 0, form.Width, form.Height));
-                    pb.Save(pOut);
-                }
-                form.SetVisitorsOpen(true);
-                Application.DoEvents();
-                Assert.Equal(["TEAM", "– VISITORS · CODEX · GROK", "CODEX", "GROK"], SectionLabels(form));
-                Assert.Equal(["dev@example.com"], FindRows(form).Where(r => r.Account.Provider != "claude").Select(r => r.Account.Email));
-                Assert.True(form.Height > closedHeight);
-                Assert.InRange(form.Height, Ui.S(300), Ui.S(560));
-                form.SetVisitorsOpen(false);
-                form.Render(snap, null);
-                Application.DoEvents();
-
-                // Expanded row (accordion) must also lay out.
-                var row = FindRows(form).First();
-                row.SetExpanded(true, animate: false);
-                Application.DoEvents();
-                Assert.True(row.Height > Ui.S(100));
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_EXPANDED_OUT") is { Length: > 0 } exOut)
-                {
-                    using var eb = new Bitmap(form.Width, form.Height);
-                    form.DrawToBitmap(eb, new Rectangle(0, 0, form.Width, form.Height));
-                    eb.Save(exOut);
-                }
-
-                // Settings open inside the flyout, widened to fit, and close back to the accounts.
-                row.SetExpanded(false, animate: false);
-                var narrow = form.Width;
-                var settings = new SettingsPanel();
-                form.ShowSettings(settings);
-                Application.DoEvents();
-                Assert.True(form.SettingsOpen && form.Width >= settings.Width && form.Height > 200);
-                // The same three names as the tray menu and the flyout, in the same order.
-                Assert.Equal(["TEAM", "WORK", "UPKEEP"], All(settings).OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP"));
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
-                {
-                    using var sb = new Bitmap(form.Width, form.Height);
-                    form.DrawToBitmap(sb, new Rectangle(0, 0, form.Width, form.Height));
-                    sb.Save(sOut);
-                }
-                // Search keeps the rows whose name, hint or section match every word.
-                settings.Search.Text = "draft";
-                Assert.Equal(["Draft pull requests"], settings.VisibleRows);
-                settings.Search.Text = "upkeep switch";
-                Assert.Equal(["Auto-switch near limit", "Automatic switch line", "Switch at"], settings.VisibleRows);
-                settings.Search.Text = "approval";
-                Assert.Equal(["Ask for approval"], settings.VisibleRows);
-                settings.Search.Text = "";
-                Assert.Equal(13, settings.VisibleRows.Count());
-                form.CloseSettings();
-                Assert.False(form.SettingsOpen);
-                Assert.True(form.Visible); // closing settings keeps the flyout open
-                Assert.Equal(narrow, form.Width);
-
-                // An approval waits on a card above the accounts; its answer removes it.
-                var asked = form.Ask("Start agents on app?", "They take its open issues.", TimeSpan.FromMinutes(1));
-                Application.DoEvents();
-                Assert.Equal(1, form.Pending);
-                var card = All(form).First(c => c.Tag as string == "ask");
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_ASK_OUT") is { Length: > 0 } aOut)
-                {
-                    using var ab = new Bitmap(form.Width, form.Height);
-                    form.DrawToBitmap(ab, new Rectangle(0, 0, form.Width, form.Height));
-                    ab.Save(aOut);
-                }
-                card.Controls.OfType<Pill>().First(p => p.Text == "Approve").PerformClick();
-                for (var i = 0; i < 20 && !asked.IsCompleted; i++) { Application.DoEvents(); Thread.Sleep(10); }
-                Assert.True(asked.IsCompletedSuccessfully && asked.Result);
-                Assert.Equal(0, form.Pending);
-
-                // The notice that replaces Windows' balloon: drawn off-screen, never shown here.
-                using var toast = new Toast("Agents need you", "app · #12 Fix login: which database should the cache use, Redis or the existing Postgres?", Palette.Current.Live, null);
-                Assert.True(toast.Width > Ui.S(300) && toast.Height is > 50 and < 160);
-                if (Environment.GetEnvironmentVariable("DOCK_RENDER_TOAST_OUT") is { Length: > 0 } tOut)
-                {
-                    using var tb = new Bitmap(toast.Width, toast.Height);
-                    toast.DrawToBitmap(tb, new Rectangle(0, 0, toast.Width, toast.Height));
-                    tb.Save(tOut);
-                }
+                form.Shimmer(-1); // the Agents button's glint sweeps for the first moments: a still frame
+                using var pb = new Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(pb, new Rectangle(0, 0, form.Width, form.Height));
+                pb.Save(pOut);
             }
-            catch (Exception e) { failure = e; }
+            form.SetVisitorsOpen(true);
+            Application.DoEvents();
+            Eq(["TEAM", "– VISITORS · CODEX · GROK", "CODEX", "GROK"], SectionLabels(form), "opened visitors");
+            Eq(["dev@example.com"], FindRows(form).Where(r => r.Account.Provider != "claude").Select(r => r.Account.Email).ToList(), "the visitor's row");
+            True(form.Height > closedHeight, $"opening visitors grows the flyout: closed {closedHeight}, open {form.Height}");
+            InRange(form.Height, Ui.S(300), Ui.S(560), "flyout height with visitors open");
+            output.WriteLine($"measured: visitors open {form.Height} (closed {closedHeight}; allowed {Ui.S(300)}..{Ui.S(560)})");
+            form.SetVisitorsOpen(false);
+            form.Render(snap, null);
+            Application.DoEvents();
+
+            // A refresh while the flyout is hidden must leave it hidden: WM_SETREDRAW TRUE sets WS_VISIBLE, which put a blank,
+            // never-activated (so never auto-hidden) flyout on the desktop.
+            form.Hide();
+            form.Render(snap, null, null, null, jobs);
+            Application.DoEvents();
+            True(!IsWindowVisible(form.Handle), "a refresh while hidden made the flyout visible");
+            form.Show();
+            form.Render(snap, null);
+            Application.DoEvents();
+
+            // Expanded row (accordion) must also lay out.
+            var row = FindRows(form).First();
+            var collapsed = row.Height; int expanded;
+            row.SetExpanded(true, animate: false);
+            Application.DoEvents();
+            expanded = row.Height;
+            True(expanded > Ui.S(100), $"an expanded row is taller than {Ui.S(100)}: collapsed {collapsed}, expanded {expanded}");
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_EXPANDED_OUT") is { Length: > 0 } exOut)
+            {
+                using var eb = new Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(eb, new Rectangle(0, 0, form.Width, form.Height));
+                eb.Save(exOut);
+            }
+
+            // Settings open inside the flyout, widened to fit, and close back to the accounts.
+            row.SetExpanded(false, animate: false);
+            var narrow = form.Width;
+            var settings = new SettingsPanel();
+            form.ShowSettings(settings);
+            Application.DoEvents();
+            True(form.SettingsOpen && form.Width >= settings.Width && form.Height > Ui.S(200),
+                $"settings fill the flyout: open={form.SettingsOpen}, flyout {form.Width}x{form.Height}, panel width {settings.Width}, needs height > {Ui.S(200)}");
+            // The same three names as the tray menu and the flyout, in the same order.
+            Eq(["TEAM", "WORK", "UPKEEP"], All(settings).OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP").ToList(), "the settings' section names");
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
+            {
+                using var sb = new Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(sb, new Rectangle(0, 0, form.Width, form.Height));
+                sb.Save(sOut);
+            }
+            // Search keeps the rows whose name, hint or section match every word.
+            settings.Search.Text = "draft";
+            Eq(["Draft pull requests"], settings.VisibleRows.ToList(), "search \"draft\"");
+            settings.Search.Text = "upkeep switch";
+            Eq(["Auto-switch near limit", "Automatic switch line", "Switch at", "Random switch delay"], settings.VisibleRows.ToList(), "search \"upkeep switch\"");
+            settings.Search.Text = "approval";
+            Eq(["Ask for approval"], settings.VisibleRows.ToList(), "search \"approval\"");
+            settings.Search.Text = "";
+            Eq(14, settings.VisibleRows.Count(), "all settings rows"); // both "Random switch delay" and "Automatic switch line"
+            form.CloseSettings();
+            True(!form.SettingsOpen, "closing settings leaves them open");
+            True(form.Visible, "closing settings keeps the flyout open, but it is hidden");
+            Eq(narrow, form.Width, "closing settings gives the flyout its width back");
+
+            // An approval waits on a card above the accounts; its answer removes it.
+            var asked = form.Ask("Start agents on app?", "They take its open issues.", TimeSpan.FromMinutes(1));
+            Application.DoEvents();
+            Eq(1, form.Pending, "an approval waits");
+            var card = All(form).First(c => c.Tag as string == "ask");
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_ASK_OUT") is { Length: > 0 } aOut)
+            {
+                using var ab = new Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(ab, new Rectangle(0, 0, form.Width, form.Height));
+                ab.Save(aOut);
+            }
+            card.Controls.OfType<Pill>().First(p => p.Text == "Approve").PerformClick();
+            True(Until(() => asked.IsCompleted), $"the approval never completed after Approve was clicked (status {asked.Status}, pending {form.Pending})");
+            True(asked.IsCompletedSuccessfully && asked.Result, $"Approve did not answer yes (status {asked.Status})");
+            Eq(0, form.Pending, "an answered approval is removed");
+
+            // The notice that replaces Windows' balloon: drawn off-screen, never shown here.
+            using var toast = new Toast("Agents need you", "app · #12 Fix login: which database should the cache use, Redis or the existing Postgres?", Palette.Current.Live, null);
+            True(toast.Width > Ui.S(300) && toast.Height > Ui.S(50) && toast.Height < Ui.S(160), $"toast is {toast.Width}x{toast.Height}, expected width > {Ui.S(300)} and height in ({Ui.S(50)}, {Ui.S(160)})");
+            output.WriteLine($"measured: toast {toast.Width}x{toast.Height}, expanded row {expanded}");
+            if (Environment.GetEnvironmentVariable("DOCK_RENDER_TOAST_OUT") is { Length: > 0 } tOut)
+            {
+                using var tb = new Bitmap(toast.Width, toast.Height);
+                toast.DrawToBitmap(tb, new Rectangle(0, 0, toast.Width, toast.Height));
+                tb.Save(tOut);
+            }
         });
-        t.SetApartmentState(ApartmentState.STA);
-        t.Start();
-        t.Join();
-        if (failure != null) throw failure;
+    }
+
+    /// The flyout never grows past 80% of the screen's work area: on a short display it stops there and its list scrolls.
+    /// This is what the other tests pin out of the way, so a small CI screen cannot hide it.
+    [Fact]
+    public void FlyoutStopsAtEightyPercentOfTheWorkArea()
+    {
+        var snap = new Snapshot(1, 1, [.. Enumerable.Range(1, 6).Select(n => new Account(n, $"a{n}@example.com", n == 1, "ok", null))]);
+        Sta(() =>
+        {
+            using var tall = NewForm(1080);
+            tall.Render(snap, null);
+            using var short_ = NewForm(300);
+            short_.Render(snap, null);
+            Eq(240, short_.Height, "a 300 px work area caps the flyout at 80%");
+            True(tall.Height > short_.Height, $"a tall work area lets the flyout grow: tall {tall.Height}, short {short_.Height}");
+        });
     }
 
     /// A row lists its account's project folders in the expanded view when they fit on a line,
@@ -830,48 +955,40 @@ public class RenderTests
         var long1 = @"c:\work\" + new string('x', 40);
         var maps = new List<ProjectMapping> { new(@"c:\work\client", "a@example.com", ""), new(@"c:\work\app", "a@example.com", "") };
         var wide = new List<ProjectMapping> { new(long1, "b@example.com", ""), new(long1 + "2", "b@example.com", "") };
-        Exception? failure = null;
-        var t = new Thread(() =>
+        Sta(() =>
         {
-            try
-            {
-                using var form = new DashboardForm { Location = new Point(-10000, -10000) };
-                var actions = new List<string>();
-                form.AccountAction += (_, act) => actions.Add(act);
-                form.Render(snap, null, null, [.. maps, .. wide]);
-                form.Show();
-                Application.DoEvents();
-                var rows = FindRows(form).ToList();
-                foreach (var r in rows) r.SetExpanded(true, animate: false);
-                var plain = new AccountRow(snap.Accounts[1], DateTimeOffset.Now);
-                plain.SetExpanded(true, animate: false);
-                Assert.Equal(plain.Height + Ui.S(22), rows[0].Height); // "Projects · client, app" fits: one more line
-                Assert.Equal(plain.Height, rows[1].Height); // two 40-character folders don't: menu only
+            using var form = NewForm();
+            var actions = new List<string>();
+            form.AccountAction += (_, act) => actions.Add(act);
+            form.Render(snap, null, null, [.. maps, .. wide]);
+            form.Show();
+            True(Until(() => form.Visible && IsWindowVisible(form.Handle)), "the flyout never showed");
+            var rows = FindRows(form).ToList();
+            True(rows.Count == 2, $"two rows expected, got {rows.Count}");
+            foreach (var r in rows) r.SetExpanded(true, animate: false);
+            var plain = new AccountRow(snap.Accounts[1], DateTimeOffset.Now);
+            plain.SetExpanded(true, animate: false);
+            Eq(plain.Height + Ui.S(22), rows[0].Height, "\"Projects · client, app\" fits: one more line than a plain row");
+            Eq(plain.Height, rows[1].Height, "two 40-character folders don't fit: menu only");
 
-                var menu = rows[0].ShowMenu(Point.Empty);
-                var projects = menu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects");
-                Assert.Contains(menu.Items.Cast<ToolStripItem>(), i => i.Text == "Assign project folder…");
-                Assert.Equal(["client", "app"], projects.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text));
-                var client = projects.DropDownItems.OfType<ToolStripMenuItem>().First(i => i.Text == "client");
-                Assert.Equal(@"c:\work\client", client.ToolTipText);
-                Assert.Equal(["Open terminal", "Remove"], client.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text));
-                client.DropDownItems.Cast<ToolStripItem>().First(i => i.Text == "Remove").PerformClick();
-                Application.DoEvents();
-                Assert.Equal([@"project-remove:c:\work\client"], actions);
+            var menu = rows[0].ShowMenu(Point.Empty);
+            var projects = menu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects");
+            True(menu.Items.Cast<ToolStripItem>().Any(i => i.Text == "Assign project folder…"), $"the menu offers to assign a folder; it has {Show(menu.Items.Cast<ToolStripItem>().Select(i => i.Text))}");
+            Eq(["client", "app"], projects.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text).ToList(), "the project folders in the menu");
+            var client = projects.DropDownItems.OfType<ToolStripMenuItem>().First(i => i.Text == "client");
+            Eq(@"c:\work\client", client.ToolTipText, "a folder's tip is its full path");
+            Eq(["Open terminal", "Remove"], client.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text).ToList(), "a folder's actions");
+            client.DropDownItems.Cast<ToolStripItem>().First(i => i.Text == "Remove").PerformClick();
+            True(Until(() => actions.Count > 0), "Remove never reached the dashboard's handler");
+            Eq([@"project-remove:c:\work\client"], actions, "the dashboard's actions");
 
-                var wideMenu = rows[1].ShowMenu(Point.Empty);
-                Assert.Equal(2, wideMenu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects").DropDownItems.Count);
-                wideMenu.Close();
-                if (!menu.IsDisposed) menu.Close();
-                Application.DoEvents();
-                plain.Dispose();
-            }
-            catch (Exception e) { failure = e; }
+            var wideMenu = rows[1].ShowMenu(Point.Empty);
+            Eq(2, wideMenu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects").DropDownItems.Count, "the wide folders are in the menu");
+            wideMenu.Close();
+            if (!menu.IsDisposed) menu.Close();
+            Application.DoEvents();
+            plain.Dispose();
         });
-        t.SetApartmentState(ApartmentState.STA);
-        t.Start();
-        t.Join();
-        if (failure != null) throw failure;
     }
 
     /// Regression: a refresh re-renders (disposing every row) while a row's menu is open.
@@ -884,34 +1001,25 @@ public class RenderTests
             new Account(1, "a@example.com", true, "ok", null),
             new Account(2, "b@example.com", false, "ok", null),
         ]);
-        Exception? failure = null;
-        var t = new Thread(() =>
+        Sta(() =>
         {
-            try
-            {
-                using var form = new DashboardForm { Location = new Point(-10000, -10000) };
-                Account? opened = null;
-                form.TerminalRequested += a => opened = a;
-                form.Render(snap, null);
-                form.Show();
-                Application.DoEvents();
-                var rows = FindRows(form).ToList();
-                var menu = rows[0].ShowMenu(Point.Empty);
-                form.Render(snap, null);
-                Assert.All(rows, r => Assert.False(r.IsDisposed)); // nothing shown changed: the same rows, no rebuild to flicker
-                form.Render(new Snapshot(1, 1, [snap.Accounts[0], snap.Accounts[1] with { Disabled = true }]), null);
-                Assert.All(rows, r => Assert.True(r.IsDisposed));
+            using var form = NewForm();
+            Account? opened = null;
+            form.TerminalRequested += a => opened = a;
+            form.Render(snap, null);
+            form.Show();
+            True(Until(() => form.Visible && IsWindowVisible(form.Handle)), "the flyout never showed");
+            var rows = FindRows(form).ToList();
+            var menu = rows[0].ShowMenu(Point.Empty);
+            form.Render(snap, null);
+            True(rows.All(r => !r.IsDisposed), "nothing shown changed: the same rows, no rebuild to flicker");
+            form.Render(new Snapshot(1, 1, [snap.Accounts[0], snap.Accounts[1] with { Disabled = true }]), null);
+            True(rows.All(r => r.IsDisposed), "a changed account rebuilds every row");
 
-                menu.Items.Cast<ToolStripItem>().First(i => i.Text == "Open terminal").PerformClick();
-                Application.DoEvents();
-                Assert.Equal(1, opened?.Number); // still reaches the dashboard's handler
-                Assert.True(menu.IsDisposed);
-            }
-            catch (Exception e) { failure = e; }
+            menu.Items.Cast<ToolStripItem>().First(i => i.Text == "Open terminal").PerformClick();
+            True(Until(() => opened != null), "Open terminal never reached the dashboard's handler");
+            Eq(1, opened?.Number, "still reaches the dashboard's handler");
+            True(Until(() => menu.IsDisposed), "the menu of a disposed row was not disposed");
         });
-        t.SetApartmentState(ApartmentState.STA);
-        t.Start();
-        t.Join();
-        if (failure != null) throw failure;
     }
 }

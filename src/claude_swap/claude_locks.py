@@ -155,7 +155,7 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(*, timeout: float | None = None, config_home: Path | None = None):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
@@ -164,18 +164,18 @@ def claude_credentials_lock(*, timeout: float | None = None):
     cswap and a waiting Claude Code can never deadlock against each other,
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
+
+    ``config_home`` names another config dir (a session profile) whose pair
+    of locks is taken instead of the default login's.
     """
+    if config_home is None:
+        primary, legacy = oauth_refresh_lock_dir(), credentials_lock_dir()
+    else:
+        primary = config_home / ".oauth_refresh.lock"
+        legacy = config_home.parent / (config_home.name + ".lock")
     with (
-        proper_lockfile(
-            oauth_refresh_lock_dir(),
-            timeout=timeout,
-            staleness=CREDENTIALS_STALENESS_S,
-        ),
-        proper_lockfile(
-            credentials_lock_dir(),
-            timeout=timeout,
-            staleness=CREDENTIALS_STALENESS_S,
-        ),
+        proper_lockfile(primary, timeout=timeout, staleness=CREDENTIALS_STALENESS_S),
+        proper_lockfile(legacy, timeout=timeout, staleness=CREDENTIALS_STALENESS_S),
     ):
         yield
 

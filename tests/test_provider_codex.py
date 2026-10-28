@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 
 import pytest
 
@@ -77,7 +78,10 @@ def test_seal_roundtrip(env):
     codex._seal_auth(3, auth)
     raw = codex._cred_path(3).read_text(encoding="utf-8")
     assert SECRET not in raw
-    assert json.loads(dpapi.unseal(raw)) == auth
+    if sys.platform != "darwin":
+        assert json.loads(dpapi.unseal(raw)) == auth
+    else:
+        assert raw.startswith("keychain-provider-v1:")
     assert codex._unseal_auth(3) == auth
 
 

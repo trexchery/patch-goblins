@@ -21,7 +21,8 @@ public sealed class Cli(string git, string? gh)
     public TimeSpan GhTimeout { get; init; } = TimeSpan.FromMinutes(2);
 
     public static Cli? Locate() =>
-        Engine.FindOnPath("git.exe") is { } git ? new Cli(git, Engine.FindOnPath("gh.exe")) : null;
+        Engine.FindOnPath(OperatingSystem.IsWindows() ? "git.exe" : "git") is { } git
+            ? new Cli(git, Engine.FindOnPath(OperatingSystem.IsWindows() ? "gh.exe" : "gh")) : null;
 
     public Task<CliResult> GitAsync(string cwd, params string[] args) => RunAsync(Git, cwd, TimeSpan.FromMinutes(5), args);
 

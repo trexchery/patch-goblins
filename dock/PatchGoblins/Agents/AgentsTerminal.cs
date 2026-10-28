@@ -77,7 +77,18 @@ public static class AgentsTerminal
         var script = Path.Combine(dir, "mascot.js");
         using (var s = typeof(AgentsTerminal).Assembly.GetManifestResourceStream("mascot.js")!)
         using (var f = File.Create(script)) s.CopyTo(f);
-        var path = script.Contains(' ') ? ShortPath(script) : script;
+        if (!OperatingSystem.IsWindows() && script.Contains(' '))
+        {
+            // Application Support always has a space. A private no-space copy
+            // keeps Bun's preload option valid without changing its parser.
+            var preload = Path.Combine("/tmp", "patch-goblins-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(preload, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var copy = Path.Combine(preload, "mascot.js");
+            File.Copy(script, copy);
+            File.SetUnixFileMode(copy, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            script = copy;
+        }
+        var path = script.Contains(' ') && OperatingSystem.IsWindows() ? ShortPath(script) : script;
         if (path == null || path.Contains(' ')) return new Dictionary<string, string>();
         var had = Environment.GetEnvironmentVariable("BUN_OPTIONS");
         // Forward slashes: BUN_OPTIONS reads a backslash as an escape and would drop it.
@@ -299,7 +310,8 @@ public static class AgentsTerminal
             sb.AppendLine("""[ -n "$__ad_out" ] && printf '%s\n' "$__ad_out" """);
         }
         sb.AppendLine("__ad_w=()");
-        sb.AppendLine("mapfile -t __ad_w 2>/dev/null < " + BashQuote(statePath));
+        sb.AppendLine(OperatingSystem.IsWindows() ? "mapfile -t __ad_w 2>/dev/null < " + BashQuote(statePath)
+            : "while IFS= read -r __ad_row; do __ad_w+=(\"$__ad_row\"); done < " + BashQuote(statePath));
         sb.AppendLine("__ad_l=${__ad_w[0]:-off}");
         sb.AppendLine("__ad_s=${__ad_l%% *}");
         sb.AppendLine("""__ad_u=; [[ $__ad_l == *' '* ]] && __ad_u=${__ad_l#* }""");
@@ -308,7 +320,7 @@ public static class AgentsTerminal
         foreach (var (state, text) in Lines)
             sb.AppendLine($"  {state}) __ad_c=({string.Join(' ', text.Select(c => BashQuote(c.ToString())))}) ;;");
         sb.AppendLine("esac");
-        sb.AppendLine("printf -v __ad_t '%(%s)T' -1");
+        sb.AppendLine(OperatingSystem.IsWindows() ? "printf -v __ad_t '%(%s)T' -1" : "__ad_t=$(date +%s)");
         sb.AppendLine($"__ad_f=$(( __ad_t / {RefreshSeconds} * {FrameStep} ))");
         sb.AppendLine("__ad_o=");
         sb.AppendLine("""for __ad_i in "${!__ad_c[@]}"; do""");

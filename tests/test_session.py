@@ -2163,17 +2163,68 @@ class TestGuards:
 
         assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
 
-    def test_switch_refuses_live_target_whose_profile_is_ahead(
+    def test_switch_starts_from_live_targets_ahead_profile(
         self, seeded_switcher, monkeypatch
     ):
-        """Once the live session has rotated past the backup, the backup is a
-        consumed generation and activating it could only fail."""
+        """A live session has rotated past the backup: the backup is a consumed
+        generation, so the default login starts from the window's own
+        generation (both copies identical) instead of refusing."""
+        monkeypatch.setattr(seeded_switcher, "follows_logins", lambda: True)  # not macOS
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         session_dir.mkdir(parents=True)
         (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
         (session_dir / ".claude.json").write_text(CONFIG)
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == ROTATED_CREDS
+        )
+        assert seeded_switcher._read_credentials() == ROTATED_CREDS
+
+    def test_macos_refuses_live_target_whose_profile_is_ahead_without_adopting(
+        self, seeded_switcher, monkeypatch
+    ):
+        """macOS cannot keep the two logins in step (`follows_logins` is False),
+        so the old refusal stands: the window's generation is not copied into the
+        backup and nothing moves."""
+        assert seeded_switcher.platform == Platform.MACOS
+        assert not seeded_switcher.follows_logins()
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        make_live(session_dir)
+        before = seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == before
+        )
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_refuses_live_target_whose_ahead_profile_cannot_be_identified(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Without a readable identity the profile's login is not copied (it
+        could be another account's), so the old refusal stands."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
         make_live(session_dir)
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
 

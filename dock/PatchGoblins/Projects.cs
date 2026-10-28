@@ -44,7 +44,8 @@ public static class ProjectMap
     {
         var dir = Path.GetFullPath(folder).TrimEnd('\\', '/');
         var best = maps.Select(m => (Map: m, Key: Path.GetFullPath(m.Folder).TrimEnd('\\', '/')))
-            .Where(x => dir.Equals(x.Key, StringComparison.OrdinalIgnoreCase) || dir.StartsWith(x.Key + "\\", StringComparison.OrdinalIgnoreCase))
+            .Where(x => dir.Equals(x.Key, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)
+                || dir.StartsWith(x.Key + Path.DirectorySeparatorChar, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
             .OrderByDescending(x => x.Key.Length)
             .Select(x => x.Map)
             .FirstOrDefault();

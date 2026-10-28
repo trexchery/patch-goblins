@@ -34,6 +34,17 @@ public class ModelSwitchTests
     }
 
     [Fact]
+    public void AFableLimitThatAsksForUsageCreditsNeverReopensWhereItWasRefused()
+    {
+        // As Claude Code 2.1.310 writes it: no rate_limit_info, no reset time, and #2's Fable reading still shows room.
+        const string line = """{"type":"assistant","timestamp":"2026-10-24T04:49:52.558Z","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."}]},"apiError":"model_requires_usage_credits","error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}""";
+        var limit = ResumeStopped.LimitOf([line]);
+        Assert.Equal(("Fable", (DateTimeOffset?)null), (limit?.Window, limit?.ResetsAt));
+        var accounts = new[] { A(1, 40, 50, 30), A(2, 10, 10, 60, active: true), A(3, 20, 20, 100) };
+        Assert.Equal(1, ResumeStopped.Target(Window(2, Fable, atLimit: true, limit), accounts, _ => true, now: Now));
+    }
+
+    [Fact]
     public void AWindowIsJudgedOnItsGeneralUsageAndItsOwnModelsWindowOnly()
     {
         var a = A(1, 40, 50, 100);

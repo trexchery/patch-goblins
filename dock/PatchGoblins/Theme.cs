@@ -53,14 +53,23 @@ public sealed record Palette(
         pct >= 95 ? Critical : pct >= WarnPct ? Warn : Brand.Dark;
 }
 
+/// Test pins for what Ui reads from the display; always null in the app. The tests set them before Ui is first touched
+/// (its statics run once) to prove layouts hold on other scales and when Segoe UI is missing.
+internal static class UiPins
+{
+    internal static float? Scale;
+    internal static string? Family;
+}
+
 /// Fonts, DPI scaling, glyphs and Win32 cosmetics shared by every surface.
 public static class Ui
 {
     // ponytail: one scale from the primary monitor at start-up; per-monitor
     // re-layout on WM_DPICHANGED if people drag the flyout across monitors.
-    public static readonly float Scale = GetScale();
+    public static readonly float Scale = UiPins.Scale ?? Real();
+    static readonly float FontPin = Scale / Real(); // 1 in the app; a pinned scale grows the fonts with the layout, as a real display does
 
-    static float GetScale()
+    static float Real()
     {
         using var g = Graphics.FromHwnd(IntPtr.Zero);
         return g.DpiX / 96f;
@@ -68,7 +77,7 @@ public static class Ui
 
     public static int S(int px) => (int)Math.Round(px * Scale);
 
-    static readonly string TextFamily = Installed("Segoe UI Variable Text") ?? "Segoe UI";
+    static readonly string TextFamily = UiPins.Family ?? Installed("Segoe UI Variable Text") ?? "Segoe UI";
     static readonly string DisplayFamily = Installed("Segoe UI Variable Display") ?? "Segoe UI";
     static readonly string IconFamily = Installed("Segoe Fluent Icons") ?? "Segoe MDL2 Assets";
 
@@ -76,7 +85,7 @@ public static class Ui
         FontFamily.Families.Any(f => f.Name == name) ? name : null;
 
     public static Font Font(float pt, bool semibold = false) =>
-        new(semibold ? (TextFamily == "Segoe UI" ? "Segoe UI Semibold" : TextFamily) : TextFamily, pt,
+        new(semibold ? (TextFamily == "Segoe UI" ? "Segoe UI Semibold" : TextFamily) : TextFamily, pt * FontPin,
             semibold && TextFamily != "Segoe UI" ? FontStyle.Bold : FontStyle.Regular);
 
     public static Font Display(float pt) => new(DisplayFamily, pt, FontStyle.Bold);

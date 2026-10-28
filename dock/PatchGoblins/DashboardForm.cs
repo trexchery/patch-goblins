@@ -223,8 +223,10 @@ public sealed class DashboardForm : Form
         if (shown == _shown && _list.Controls.Count > 0) return;
         _shown = shown;
         ApplyTheme();
-        // Painting off while the rows are rebuilt, then one paint: no row-by-row flash.
-        if (IsHandleCreated) SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 0, 0);
+        // Painting off while the rows are rebuilt, then one paint: no row-by-row flash. Shown only: WM_SETREDRAW on sets
+        // WS_VISIBLE, which put a hidden flyout on screen blank and never activated, so never hidden again.
+        var redraw = IsHandleCreated && Visible;
+        if (redraw) SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 0, 0);
         _list.SuspendLayout();
         // Copy first: Dispose removes the control, so enumerating live would skip every other one.
         foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
@@ -273,7 +275,7 @@ public sealed class DashboardForm : Form
         }
         _list.ResumeLayout();
         FitHeight();
-        if (IsHandleCreated)
+        if (redraw)
         {
             SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 1, 0);
             Refresh();
@@ -431,12 +433,15 @@ public sealed class DashboardForm : Form
         return card;
     }
 
+    /// Tests pin the screen height the flyout may fill: a small CI display would otherwise cap it and hide growth.
+    internal int? WorkAreaHeight;
+
     /// Grows/shrinks with content, keeping the edge nearest the taskbar fixed.
     void FitHeight()
     {
         var content = _settings?.ContentHeight ?? _list.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical) + _list.Padding.Vertical;
-        var screen = Screen.FromPoint(Visible ? Location : Cursor.Position).WorkingArea;
-        var h = Math.Min(_header.Height + (_settings == null ? _footer.Height : 0) + content + Padding.Vertical, (int)(screen.Height * 0.8));
+        var screenHeight = WorkAreaHeight ?? Screen.FromPoint(Visible ? Location : Cursor.Position).WorkingArea.Height;
+        var h = Math.Min(_header.Height + (_settings == null ? _footer.Height : 0) + content + Padding.Vertical, (int)(screenHeight * 0.8));
         if (h == Height) return;
         var bottom = Bottom;
         Height = h;

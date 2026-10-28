@@ -9,6 +9,13 @@ static class Program
         if (args is ["agents-mcp", ..]) { Environment.ExitCode = AgentsLink.ServeMcp(args); return; }
         // A read-only readiness report on a repository, printed to the console it was started from.
         if (args is ["doctor", ..]) { Environment.ExitCode = Doctor.Run(args); return; }
+        // An agent's PreToolUse hook: may this file tool call reach that path?
+        if (args is ["guard", _, ..])
+        {
+            using var why = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
+            Environment.ExitCode = Policy.Hook(args[1..], () => new StreamReader(Console.OpenStandardInput(), System.Text.Encoding.UTF8).ReadToEnd(), why);
+            return;
+        }
 
         var isolated = DockSettings.Env("DATA") is { Length: > 0 } ? "-" + AgentStore.KeyFor(DockSettings.Dir) : "";
         using var mutex = new Mutex(true, @"Local\PatchGoblins-" + Environment.UserName + isolated, out var first);

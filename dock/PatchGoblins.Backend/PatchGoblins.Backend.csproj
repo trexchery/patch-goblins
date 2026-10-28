@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>patch-goblins-backend</AssemblyName>
+    <Version>0.7.0</Version>
+    <Product>Patch Goblins</Product>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../PatchGoblins/Engine.cs" Link="Shared/Engine.cs" />
+    <Compile Include="../PatchGoblins/Models.cs" Link="Shared/Models.cs" />
+    <Compile Include="../PatchGoblins/DockSettings.cs" Link="Shared/DockSettings.cs" />
+    <Compile Include="../PatchGoblins/Security.cs" Link="Shared/Security.cs" />
+    <Compile Include="../PatchGoblins/Projects.cs" Link="Shared/Projects.cs" />
+    <Compile Include="../PatchGoblins/Jobs.cs" Link="Shared/Jobs.cs" />
+    <Compile Include="../PatchGoblins/Format.cs" Link="Shared/Format.cs" />
+    <Compile Include="../PatchGoblins/AutoPrime.cs" Link="Shared/AutoPrime.cs" />
+    <Compile Include="../PatchGoblins/SwitchLine.cs" Link="Shared/SwitchLine.cs" />
+    <Compile Include="../PatchGoblins/LimitWatch.cs" Link="Shared/LimitWatch.cs" />
+    <Compile Include="../PatchGoblins/ResumeStopped.cs" Link="Shared/ResumeStopped.cs" />
+    <Compile Include="../PatchGoblins/QuotaAlerts.cs" Link="Shared/QuotaAlerts.cs" />
+    <Compile Include="../PatchGoblins/Agents/*.cs" Exclude="../PatchGoblins/Agents/TrayApp.Agents.cs;../PatchGoblins/Agents/AgentProcess.cs" LinkBase="Shared/Agents" />
+    <EmbeddedResource Include="../PatchGoblins/Agents/mascot.js" LogicalName="mascot.js" />
+    <None Include="worker_host.py" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <InternalsVisibleTo Include="PatchGoblins.Backend.Tests" />
+  </ItemGroup>
+</Project>

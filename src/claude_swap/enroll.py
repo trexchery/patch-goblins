@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from claude_swap.exceptions import TransferError
 from claude_swap.models import get_timestamp
 from claude_swap.paths import _pick_global_config
+from claude_swap.session import read_config_dir_credentials
 from claude_swap.transfer import (
     FORMAT_VERSION,
     _parse_payload,
@@ -37,8 +38,8 @@ if TYPE_CHECKING:
 
 def build_envelope(config_dir: Path, slot: int) -> dict:
     """One-account export envelope from a Claude Code config directory."""
-    creds_path = config_dir / ".credentials.json"
-    if not creds_path.is_file():
+    credentials = read_config_dir_credentials(str(config_dir), strict_keychain=True)
+    if not credentials:
         raise TransferError(
             f"no login found in {config_dir} (did `claude auth login` finish?)"
         )
@@ -47,7 +48,7 @@ def build_envelope(config_dir: Path, slot: int) -> dict:
         raise TransferError(f"no Claude config found in {config_dir}")
 
     creds = _slim_credentials(
-        _parse_payload(creds_path.read_text(encoding="utf-8"), "enrolled credentials")
+        _parse_payload(credentials, "enrolled credentials")
     )
     if not isinstance(creds.get("claudeAiOauth"), dict):
         raise TransferError("enrolled credentials carry no Claude OAuth login")

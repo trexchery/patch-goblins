@@ -34,6 +34,7 @@ from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.json_output import SCHEMA_VERSION, error_envelope, usage_to_json
 from claude_swap.paths import get_backup_root
 from claude_swap.process_detection import is_pid_alive
+from claude_swap.providers import _credentials
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 FETCH_TTL_S = 180
@@ -93,12 +94,12 @@ def _cred_path(n: int) -> Path:
 
 
 def _seal_auth(n: int, auth: dict) -> None:
-    _atomic_write(_cred_path(n), dpapi.seal(json.dumps(auth)))
+    _credentials.write(_cred_path(n), json.dumps(auth), _atomic_write)
 
 
 def _unseal_auth(n: int) -> dict:
     try:
-        return json.loads(dpapi.unseal(read_text_with_retry(_cred_path(n))))
+        return json.loads(_credentials.read(_cred_path(n), _atomic_write))
     except FileNotFoundError:
         raise CodexError(f"account {n} has no stored credentials") from None
 
@@ -354,8 +355,11 @@ def cmd_switch(n: int) -> dict:
 
 def cmd_remove(n: int) -> dict:
     acc = _find(n)
+    if sys.platform == "darwin":
+        _credentials.delete(_cred_path(n))
     _save_roster([a for a in _roster() if a["number"] != n])
-    _cred_path(n).unlink(missing_ok=True)
+    if sys.platform != "darwin":
+        _cred_path(n).unlink(missing_ok=True)
     return {"schemaVersion": SCHEMA_VERSION, "removed": {"number": n, "email": acc["email"]}}
 
 

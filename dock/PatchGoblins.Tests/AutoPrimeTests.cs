@@ -288,6 +288,12 @@ public class TerminalEnvironmentTests
             ("CLAUDE_CODE_SESSION_LOG", "1"), ("PATH", @"C:\x"));
         Engine.TopLevel(own, () => throw new InvalidOperationException("not needed"));
         Assert.Equal(["AI_AGENT", "CLAUDE_CODE_SESSION_LOG", "CLAUDE_EFFORT", "NO_COLOR", "PATH"], own.Keys.Order(StringComparer.Ordinal)); // the owner's diagnostics stay
+
+        // Started by a process that already dropped the markers (a restarted tray): the session's NO_COLOR goes all the same.
+        var relayed = Env(("AI_AGENT", "claude-code_2-1-309_agent"), ("NO_COLOR", "1"), ("PATH", @"C:\x"));
+        Engine.TopLevel(relayed, () => windows);
+        Assert.False(relayed.ContainsKey("NO_COLOR"));
+        Assert.False(relayed.ContainsKey("AI_AGENT"));
     }
 
     [Fact]

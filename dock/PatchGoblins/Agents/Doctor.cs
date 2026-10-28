@@ -456,7 +456,7 @@ public static class Doctor
     /// `patch-goblins.exe doctor [folder] [--base branch] [--verify command] [--bootstrap]`: exit 0 ready, 1 limited, 2 blocked, 3 unusable.
     public static int Run(string[] args)
     {
-        AttachConsole(-1); // a window app writes to the console it was started from
+        if (OperatingSystem.IsWindows()) AttachConsole(-1); // a window app writes to the console it was started from
         Console.OutputEncoding = Encoding.UTF8;
         string? Arg(string name) => Array.IndexOf(args, name) is var i and >= 0 && i + 1 < args.Length ? args[i + 1] : null;
         var path = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--") && a != Arg("--base") && a != Arg("--verify")) ?? Environment.CurrentDirectory;

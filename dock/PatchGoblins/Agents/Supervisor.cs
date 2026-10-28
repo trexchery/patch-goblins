@@ -47,6 +47,8 @@ public sealed class AgentsConfig
     public bool Ultracode { get; set; }
     /// The Director orders and routes queued work no goal planned (Supervisor.WantsTriage). Off: it runs on default routes.
     public bool Triage { get; set; } = true;
+    /// The most a finished run's cleanup waits for its probe checkout to go (Supervisor.TryRemoveProbeAsync); a hung git must not hold the goal busy.
+    public TimeSpan ProbeCleanup { get; set; } = TimeSpan.FromSeconds(30);
 }
 
 /// `Transient`: nothing is wrong with the work itself (a fetch that failed, as when offline), so it is no failure to count.
@@ -419,7 +421,9 @@ public sealed partial class Supervisor : IDisposable
             Notify?.Invoke("Agents waiting for usage", "Every Claude account is near its limit" + (back is { } t ? $"; they continue by themselves {Format.When(t, DateTimeOffset.Now)}." : "."));
         }
         else if (!allOut && _allOut && (started || _workers.Count > 0)) Notify?.Invoke("Agents resumed", "A Claude account has usage again.");
-        _allOut = allOut;
+        // Account refresh and baseline checks can interleave a pass with no
+        // dispatch. Keep the notification pending until work actually resumes.
+        _allOut = allOut || (_allOut && !started && _workers.Count == 0);
         _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold, _solo) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
     }
 
@@ -501,7 +505,9 @@ public sealed partial class Supervisor : IDisposable
                 Save();
                 return;
             }
-            string[] deny = [.. policy.Deny];
+            List<string> narrowed = [];
+            string[] deny = [.. Policy.Confine(policy.Deny, wt, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), narrowed)];
+            foreach (var n in narrowed) Program.Log($"{repo.Leaf} {item.Label}: {n}");
             var org = account.OrganizationUuid ?? "";
             var resume = !review && item.Session is { } s && s.Email == account.Email && s.Org == org;
             string prompt;
@@ -547,7 +553,7 @@ public sealed partial class Supervisor : IDisposable
             item.Route ??= Routing.Default; // started unrouted: escalation needs a base
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings, own: _solo && account.Active, deny), wt, item.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, wt, settings, own: _solo && account.Active, deny, [.. policy.AddDirs]), wt, item.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
@@ -579,18 +585,37 @@ public sealed partial class Supervisor : IDisposable
 
     /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login. `own`: the one
     /// account there is, and it is the default login (AccountPicker.Solo): the engine then launches plain claude on it, never a second copy of its login.
-    /// Runs cannot push or call gh, nor use what the repository's policy denies; reviewers cannot edit files either. Every run
-    /// states its model, effort and ultracode.
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null, bool own = false, string[]? deny = null) =>
+    /// Runs cannot push or call gh, nor use what the repository's policy denies (Policy.Confine); reviewers cannot edit files
+    /// either. Their file tools reach their worktree and the folders the owner approved (`dirs`, Policy.AddDirs), nothing
+    /// else (Policy.Guard). Every run states its model, effort and ultracode.
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, string worktree, RunSettings? settings = null, bool own = false, string[]? deny = null, string[]? dirs = null) =>
     [
         "run", account.ToString(), .. own ? (string[])[] : ["--require-session"], "--",
         "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", // a request that streams is never taken for a stall
         resume ? "--resume" : "--session-id", session,
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
+        .. (dirs ?? []).SelectMany(d => new[] { "--add-dir", d }),
         "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [], .. deny ?? [],
-        .. settings != null ? Routing.Args(settings) : [],
+        .. settings != null ? Routing.Args(settings, Guard(worktree, dirs ?? [])) : ["--settings", JsonSerializer.Serialize(new { hooks = Guard(worktree, dirs ?? []) })],
     ];
+
+    /// The PreToolUse hook that runs Policy.Guard on every file tool call, with the folders the run may reach: its
+    /// worktree, where Claude Code keeps its long tool outputs for that folder, and the owner's approved ones.
+    static object Guard(string worktree, string[] dirs) => Guard(worktree, dirs, !OperatingSystem.IsWindows());
+
+    /// `posix`: macOS and Linux. The hook runs under sh there, so each argument is single-quoted and kept literally. Claude
+    /// Code keeps a folder's long tool outputs in `<tmp>/claude/<the folder's path, every other character a dash>`, where
+    /// `<tmp>` is /tmp (macOS: also /private/tmp, the same place) unless the temp folder differs.
+    internal static object Guard(string worktree, string[] dirs, bool posix)
+    {
+        var kept = Regex.Replace(posix ? Policy.Full(worktree, "/", true) : Path.GetFullPath(worktree), "[^A-Za-z0-9]", "-");
+        string[] temps = posix ? [.. new[] { "/tmp", "/private/tmp", Path.GetTempPath().TrimEnd('/') }.Distinct().Select(t => $"{t}/claude/{kept}")] : [Path.Combine(Path.GetTempPath(), "claude", kept)];
+        string[] roots = [worktree, .. temps, .. dirs];
+        string[] call = [Environment.ProcessPath!, "guard", .. roots];
+        var command = string.Join(' ', call.Select(a => posix ? "'" + a.Replace("'", @"'\''") + "'" : $"\"{a.Replace('\\', '/')}\""));
+        return new { PreToolUse = Policy.GuardedTools.Select(t => new { matcher = t, hooks = new[] { new { type = "command", command } } }) };
+    }
 
     /// The tray's environment, minus anything that would point Claude elsewhere, plus a guard between
     /// runs and GitHub: no git remote, no gh login, no git credential helper; Patch Goblins pushes and opens
@@ -949,6 +974,16 @@ public sealed partial class Supervisor : IDisposable
     public void Poke() => Pump();
 
     internal bool Pumping => _pumping;
+
+    /// Why nothing starts, for a test that timed out waiting: the flags a launch needs clear, and what each goal waits on.
+    internal string Diagnose()
+    {
+        var now = DateTimeOffset.Now;
+        string Goals(RepoAgents r) => string.Join("; ", r.Goals.Select(g => $"{g.Id} replan={g.Replan} claim={g.Claim != null} wantsPlan={WantsPlan(r, g)} dueIn={Until(g.LastPlan, Config.ReplanEvery).TotalSeconds:0.0}s"));
+        return $"pumping={_pumping} again={_pumpAgain} launching={_launching} stopping={_stopping} workers={_workers.Count} verifying={_verifying.Count} gitGate={_gitGate.CurrentCount} "
+            + $"busy=[{string.Join(", ", _goalBusy.Select(b => $"{b.Key.Id}:{b.Value}"))}] notBefore=[{string.Join(", ", _notBefore.Select(n => $"{(n.Value - now).TotalSeconds:0.0}s"))}] "
+            + string.Join(" | ", _state.Repos.Select(r => $"{r.Leaf} active={Active(r)} {Goals(r)}"));
+    }
 
     public void Attach(string path)
     {

@@ -32,6 +32,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "threshold": None,
         "interval": None,
         "cooldown": None,
+        "switch_buffer": None,
         "include_api_key_accounts": None,
         "strategy": None,
     }
@@ -255,6 +256,10 @@ class TestMergedWithCli:
     def test_no_flags_returns_settings_unchanged(self):
         base = AutoSwitchSettings(threshold=80.0)
         assert merged_with_cli(base, _args()) is base
+
+    def test_switch_buffer_cli_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(switch_buffer=45))
+        assert merged.switch_buffer_seconds == 45
 
     def test_cli_beats_settings(self):
         base = AutoSwitchSettings(threshold=80.0, cooldown_seconds=10.0)

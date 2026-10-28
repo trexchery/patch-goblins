@@ -1959,6 +1959,148 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    # A held account's login is refreshed by us this long before it expires,
+    # ahead of Claude Code's own 5-minute window, so only one process ever
+    # refreshes it (the tray polls every 3 minutes: 15 minutes of margin).
+    FOLLOW_REFRESH_MS = 20 * 60 * 1000
+
+    def follows_logins(self) -> bool:
+        """Whether a default login on a held account can be kept in step with its window.
+
+        False on macOS: the profile's login lives in a keychain entry only claude
+        writes, so ``follow_logins`` cannot re-sync the two copies of the rotating
+        token. There a held account stays refused (``exclusive``) and auto skips it,
+        as before; elsewhere a switch onto it is allowed and the copies follow."""
+        return self.platform != Platform.MACOS
+
+    def follow_logins(self) -> dict:
+        """Keep the default login and its live ``cswap run`` window on ONE login.
+
+        The default login on an account a session profile also runs holds two
+        copies of one rotating token family; a refresh in one strands the
+        other. So: the copy with the later ``expiresAt`` is written over the
+        other (Claude Code re-reads ``.credentials.json`` when its mtime
+        changes), and when the shared login is within ``FOLLOW_REFRESH_MS`` of
+        expiring it is refreshed HERE, once, through the consume gate, and the
+        result written to both copies, so neither window refreshes on its own.
+        Every write holds Claude Code's own refresh locks for that config dir.
+
+        Returns ``{"status": ...}``: ``alone`` (nothing to follow), ``synced``,
+        ``refreshed``, ``busy`` (a lock was held: next poll), ``refresh-failed``.
+        """
+        from claude_swap.exceptions import ClaudeCodeLockTimeout
+        from claude_swap.session import (
+            clear_session_stale,
+            is_session_stale,
+            session_identity_drifted,
+        )
+
+        if not self.follows_logins():
+            return {"status": "alone"}
+
+        def held() -> tuple[str, str, Path, bool] | None:
+            """The live login's slot, email, profile and stale flag, when a live window follows it."""
+            num = self.current_account_number()
+            account = (self._get_sequence_data() or {}).get("accounts", {}).get(num or "", {})
+            email = account.get("email", "")
+            if not email:
+                return None
+            org = account.get("organizationUuid", "") or ""
+            session_dir = self._session_dir(num, email)
+            if (
+                not session_dir.is_dir()
+                or not self._live_session_pids(num, email)
+                or session_identity_drifted(session_dir, email, org)
+            ):
+                return None
+            return num, email, session_dir, is_session_stale(session_dir)
+
+        # Every read-decide-write holds cswap's lock, then Claude Code's refresh locks
+        # (``_perform_switch``'s order): a switch can never land between reading which
+        # account is live and writing its login, so no other account's login is copied.
+        try:
+            with FileLock(self.lock_file):
+                found = held()
+                if found is None:
+                    return {"status": "alone"}
+                num, email, session_dir, stale = found
+                if stale:
+                    # The backup moved under the window (the gate refreshed it, or a
+                    # re-login): follow only to copy a strictly newer backup down to both.
+                    backup = self._store._read_account_credentials(num, email)
+                    newest = self._follow_sync(session_dir, fresh=backup, fresh_only=True)
+                    if newest is None:
+                        return {"status": "alone"}
+                    clear_session_stale(session_dir)
+                    return {"status": "synced"}
+                newest = self._follow_sync(session_dir)
+                if newest is None:
+                    return {"status": "alone"}
+                expires = (oauth.extract_oauth_data(newest) or {}).get("expiresAt")
+                if not isinstance(expires, (int, float)) or expires - time.time() * 1000 > self.FOLLOW_REFRESH_MS:
+                    return {"status": "synced"}
+                # The backup holds the newest generation, then the gate refreshes it: serialized with the usage collector.
+                self._store._write_account_credentials(num, email, newest)
+            outcome = self.consume_backup_grant(num, email, newest)
+            if outcome.error is not None or not outcome.credentials:
+                return {"status": "refresh-failed", "error": outcome.error}
+            with FileLock(self.lock_file):
+                if (held() or ())[:3] != (num, email, session_dir):
+                    return {"status": "alone"}  # switched meanwhile: the new generation stays in num's backup
+                self._follow_sync(session_dir, fresh=outcome.credentials)
+                clear_session_stale(session_dir)  # the gate's persist marked it; both copies now hold the backup's generation
+            return {"status": "refreshed"}
+        except ClaudeCodeLockTimeout:
+            # The stale mark stays when the post-refresh write could not run: the next
+            # tick copies the backup's newer generation down (the ``stale`` arm above).
+            return {"status": "busy"}
+
+    def _follow_sync(
+        self, session_dir: Path, fresh: str | None = None, fresh_only: bool = False
+    ) -> str | None:
+        """Under both config dirs' refresh locks: the copy with the latest
+        ``expiresAt`` (of the default login's, the profile's and ``fresh``)
+        replaces the older ones' OAuth login. Only the ``claudeAiOauth`` object
+        moves; each file keeps its own other fields. Returns the newest login,
+        None when none is usable. ``fresh_only``: write nothing (None) unless
+        ``fresh`` is strictly the newest. The caller holds ``self.lock_file``.
+        Never logs a token."""
+        from claude_swap.claude_locks import claude_credentials_lock
+        from claude_swap.session import read_session_credentials
+        from claude_swap.settings import atomic_write_json
+
+        def expires(creds: str | None) -> float:
+            data = oauth.extract_oauth_data(creds) if creds else None
+            value = (data or {}).get("expiresAt") if data and data.get("refreshToken") else None
+            return float(value) if isinstance(value, (int, float)) else -1.0
+
+        def grafted(base: str | None, source: str) -> dict:
+            try:
+                doc = json.loads(base) if base else {}
+            except json.JSONDecodeError:
+                doc = {}
+            doc = doc if isinstance(doc, dict) else {}
+            doc["claudeAiOauth"] = oauth.extract_oauth_data(source)
+            return doc
+
+        with (
+            claude_credentials_lock(timeout=3.0, config_home=session_dir),
+            claude_credentials_lock(timeout=3.0),
+        ):
+            default = self._read_credentials()
+            profile = read_session_credentials(session_dir)
+            best = max((c for c in (default, profile, fresh) if c), key=expires, default=None)
+            if best is None or expires(best) < 0:
+                return None
+            if fresh_only and not expires(fresh) > max(expires(default), expires(profile)):
+                return None
+            # Only a copy that holds a readable, older login is replaced: an unreadable or foreign file is left alone.
+            if 0 <= expires(default) < expires(best):
+                self._write_credentials(json.dumps(grafted(default, best)))
+            if 0 <= expires(profile) < expires(best):
+                atomic_write_json(session_dir / ".credentials.json", grafted(profile, best))
+            return best
+
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -2850,7 +2992,7 @@ class ClaudeAccountSwitcher:
         return profile if newer else None
 
     def _adopt_session_credential(
-        self, account_num: str, email: str, org_uuid: str
+        self, account_num: str, email: str, org_uuid: str, live: bool = False
     ) -> bool | None:
         """Capture a quiescent session profile's credential into the slot backup.
 
@@ -2864,7 +3006,10 @@ class ClaudeAccountSwitcher:
         re-bootstrapped.
 
         Only while the profile is quiescent: a live claude is rotating that
-        family and owns it. Decided and written under cswap's own lock, since
+        family and owns it. ``live`` takes a snapshot of it anyway (a read of
+        the profile, a write of the backup only): the switch that starts the
+        default login on a held account begins from the window's own
+        generation, so the two copies are identical. Decided and written under cswap's own lock, since
         ``_bootstrap`` and the consume gate's persist move the same two
         copies. The store write is deliberately the pure one:
         ``_post_backup_write`` would invalidate the very profile just
@@ -2897,8 +3042,9 @@ class ClaudeAccountSwitcher:
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir) or live_run_markers(
-                session_dir, ignore=os.getpid()
+            if not live and (
+                not profile_is_quiescent(session_dir)
+                or live_run_markers(session_dir, ignore=os.getpid())
             ):
                 return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
@@ -6841,7 +6987,11 @@ class ClaudeAccountSwitcher:
                 wrappers = []  # the adoption below asks again, and refuses on not knowing
             pids += [p for p in wrappers if p not in pids]
             if pids or unreadable:
-                if self._session_profile_ahead(target_account, pre_email, pre_org):
+                if self._session_profile_ahead(
+                    target_account, pre_email, pre_org
+                ) and not self._adopt_session_credential(
+                    target_account, pre_email, pre_org, live=self.follows_logins()
+                ):
                     who = (
                         "a live session-mode Claude instance "
                         f"(PID {', '.join(map(str, pids))})"

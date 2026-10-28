@@ -21,8 +21,17 @@ public sealed partial class Engine(string exe)
     {
         var env = DockSettings.Env("ENGINE");
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
-        var bundled = Path.Combine(AppContext.BaseDirectory, "engine", "cswap.exe");
+        var bundled = Path.Combine(AppContext.BaseDirectory, "engine", OperatingSystem.IsWindows() ? "cswap.exe" : "cswap");
         if (File.Exists(bundled)) return new Engine(bundled);
+        if (!OperatingSystem.IsWindows())
+        {
+            var appEngine = new[]
+            {
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "MacOS", "cswap")),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "engine", "cswap")),
+            }.FirstOrDefault(File.Exists);
+            if (appEngine != null) return new Engine(appEngine);
+        }
         // No PATH fallback: an upstream claude-swap there lacks DPAPI sealing and providers.
         throw new EngineException(
             "Engine not found. Expected engine\\cswap.exe next to patch-goblins.exe; " +
@@ -62,6 +71,7 @@ public sealed partial class Engine(string exe)
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
+            foreach (var a in PrefixArgs) psi.ArgumentList.Add(a);
             foreach (var a in args) psi.ArgumentList.Add(a);
             psi.Environment["PYTHONIOENCODING"] = "utf-8";
             psi.Environment["PYTHONUTF8"] = "1";
@@ -114,8 +124,12 @@ public sealed partial class Engine(string exe)
     /// The two calls a usage-limit error makes, not queued behind the gate (an `auto --once` can hold it for ~30 s). Safe:
     /// the engine serializes what it mutates itself, as it must for several terminals (the store's FileLock, Claude Code's
     /// credential lock; `import-usage` under the usage store's), so only the call order is ours.
-    /// `--exclusive`: unattended, so the engine refuses an account a `cswap run` window holds rather than warn nobody.
-    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json", "--exclusive"], gated: false);
+    /// Not `--exclusive` where the engine follows logins (Windows, Linux): an account a `cswap run` window holds is still switched to
+    /// (the engine warns; it refuses only when that profile's login is ahead). On macOS nothing keeps the two logins in step (the
+    /// profile's lives in a keychain entry only claude writes), so `--exclusive` stays: the engine refuses a held account.
+    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(SwitchNowArgs(number, OperatingSystem.IsMacOS()), gated: false);
+
+    internal static string[] SwitchNowArgs(int number, bool macOS) => macOS ? ["switch", number.ToString(), "--json", "--exclusive"] : ["switch", number.ToString(), "--json"];
 
     public async Task ImportUsageAsync(string document)
     {
@@ -134,11 +148,12 @@ public sealed partial class Engine(string exe)
     /// One auto-switch tick. The engine owns thresholds, cooldown, hysteresis,
     /// quarantine and the disabled/API-key exclusions; exit 0=switched 2=no-op 3=blocked.
     /// `threshold`: this tick's line instead of the engine's saved one (the tray's automatic line).
-    public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync(double? threshold = null)
+    public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync(double? threshold = null, CancellationToken ct = default)
     {
+        // Pocket the random switch buffer (up to its 300 s ceiling) on top of the usual fetch time.
         var r = await RunAsync(threshold is { } t
             ? ["auto", "--once", "--json", "--threshold", t.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)]
-            : ["auto", "--once", "--json"]);
+            : ["auto", "--once", "--json"], TimeSpan.FromSeconds(360), ct: ct);
         return (r.ExitCode, ParseEvents(r.Stdout));
     }
 
@@ -183,6 +198,11 @@ public sealed partial class Engine(string exe)
 
     public static void LaunchConsoleWith(string Exe, string title, string? workDir, string[] args, IReadOnlyDictionary<string, string>? env)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            LaunchPosixConsole(Exe, title, workDir, args, env);
+            return;
+        }
         var wt = FindProgram("wt.exe", WindowsApps);
         var shell = Shell;
         var psi = wt != null
@@ -221,7 +241,11 @@ public sealed partial class Engine(string exe)
     /// markers.
     internal static void TopLevel(IDictionary<string, string?> env, Func<IReadOnlyDictionary<string, string>?> fresh)
     {
-        if (env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)) && fresh() is { } clean)
+        // AI_AGENT too: a process started by one that already dropped the markers (a restarted tray) still carries the
+        // session's NO_COLOR, and every terminal it opened drew without colors.
+        if ((env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase))
+                || env.Any(v => v.Key.Equals("AI_AGENT", StringComparison.OrdinalIgnoreCase) && v.Value?.StartsWith("claude-code", StringComparison.OrdinalIgnoreCase) == true))
+            && fresh() is { } clean)
         {
             // Patch Goblins' own (an isolated instance's PATCH_GOBLINS_DATA) carry over: its terminals talk to it.
             var own = env.Where(v => v.Key.StartsWith("PATCH_GOBLINS_", StringComparison.OrdinalIgnoreCase) || v.Key.StartsWith("HANDOFF_", StringComparison.OrdinalIgnoreCase)).ToList();
@@ -234,6 +258,7 @@ public sealed partial class Engine(string exe)
     /// Machine, user and volatile variables, as Windows builds them for a new process of this user.
     internal static IReadOnlyDictionary<string, string>? FreshEnvironment()
     {
+        if (!OperatingSystem.IsWindows()) return null;
         if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x0008 /* TOKEN_QUERY */, out var token)) return null;
         try
         {
@@ -316,4 +341,37 @@ public sealed partial class Engine(string exe)
     private static partial Regex SecretPattern();
 
     public static string Redact(string s) => SecretPattern().Replace(s, "[redacted]");
+
+    /// Frozen Python applications dispatch the existing CLI through an argv prefix, never a shell string.
+    internal static string[] PrefixArgs => System.Text.Json.JsonSerializer.Deserialize<string[]>(DockSettings.Env("ENGINE_ARGS") ?? "[]") ?? [];
+
+    internal static string PosixQuote(string value) => "'" + value.Replace("'", "'\\''") + "'";
+
+    static void LaunchPosixConsole(string exe, string title, string? cwd, string[] args, IReadOnlyDictionary<string, string>? env)
+    {
+        if (!OperatingSystem.IsMacOS()) throw new PlatformNotSupportedException("Visible terminals require macOS or Windows");
+        var dir = Path.Combine(DockSettings.Dir, "terminal-launches");
+        Directory.CreateDirectory(dir);
+        var script = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".command");
+        var scriptText = new StringBuilder("#!/bin/zsh\n");
+        scriptText.Append("cd -- ").Append(PosixQuote(cwd ?? StoreSecurity.UserProfile)).Append(" || exit\n");
+        foreach (var key in new[] { "PATH", "PATCH_GOBLINS_DATA", "PATCH_GOBLINS_ENGINE", "PATCH_GOBLINS_ENGINE_ARGS", "PATCH_GOBLINS_PYTHON", "PATCH_GOBLINS_PYTHON_ARGS", "PATCH_GOBLINS_APP_EXECUTABLE" })
+            if (Environment.GetEnvironmentVariable(key) is { } value)
+                scriptText.Append("export ").Append(key).Append('=').Append(PosixQuote(value)).Append('\n');
+        foreach (var name in SessionMarkers(Environment.GetEnvironmentVariables().Keys.OfType<string>()))
+            scriptText.Append("unset ").Append(name).Append('\n');
+        foreach (var (key, value) in env ?? new Dictionary<string, string>())
+        {
+            if (!Regex.IsMatch(key, "^[A-Za-z_][A-Za-z0-9_]*$")) throw new ArgumentException("Invalid terminal environment name");
+            scriptText.Append("export ").Append(key).Append('=').Append(PosixQuote(value)).Append('\n');
+        }
+        var prefix = exe == DockSettings.Env("ENGINE") ? PrefixArgs : [];
+        scriptText.Append("rm -- ").Append(PosixQuote(script)).Append('\n');
+        scriptText.Append(string.Join(' ', new[] { exe }.Concat(prefix).Concat(args).Select(PosixQuote))).Append('\n');
+        File.WriteAllText(script, scriptText.ToString());
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var psi = new ProcessStartInfo("/usr/bin/open") { UseShellExecute = false };
+        foreach (var arg in new[] { "-a", "Terminal", script }) psi.ArgumentList.Add(arg);
+        Process.Start(psi)?.Dispose();
+    }
 }
