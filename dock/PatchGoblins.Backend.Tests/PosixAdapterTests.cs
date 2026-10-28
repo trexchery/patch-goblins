@@ -9,6 +9,25 @@ namespace PatchGoblins.Tests;
 
 public sealed class PosixAdapterTests
 {
+    /// The macOS move (BackendUpkeep.ResumeAsync) shares `Decide`: an idle window whose project has a workflow running is left alone,
+    /// and one at its limit is only reported. Synthetic run folders on the native file system.
+    [Fact]
+    public void AWindowRunningAWorkflowIsNeverMovedOnPosix()
+    {
+        using var tmp = new TempDir();
+        var project = Path.Combine(tmp.Path, "projects", "-w");
+        var run = Path.Combine(project, "old-sid", "subagents", "workflows", "wf_a");
+        Directory.CreateDirectory(run);
+        File.WriteAllLines(Path.Combine(run, "journal.jsonl"), ["""{"type":"launched"}""", """{"type":"started","key":"k","agentId":"a","label":"x","phase":"P"}"""]);
+        var runs = ResumeStopped.RunningWorkflows(project, DateTime.UtcNow.AddMinutes(-5), Path.Combine(tmp.Path, "tmp"));
+        Assert.Equal(["k"], Assert.Single(runs).InFlight);
+        var idle = new StoppedSession(1, "sid", "/w", Path.Combine(tmp.Path, "profile"), 3, Path.Combine(project, "sid.jsonl"), false, Runs: runs);
+        ResumeStopped.Step Of(StoppedSession s) => ResumeStopped.Decide(s, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true);
+        Assert.Equal(ResumeStopped.Step.Ignore, Of(idle));
+        Assert.Equal(ResumeStopped.Step.Left, Of(idle with { AtLimit = true }));
+        Assert.Equal(ResumeStopped.Step.Move, Of(idle with { Runs = null }));
+    }
+
     /// The check right before a close holds only for the process that wrote the record: a missing, unreadable or other
     /// start stamp is not a match (unknown means alive only where nothing is killed). Reads only; this process is the pid.
     [Fact]
