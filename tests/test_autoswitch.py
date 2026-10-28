@@ -541,6 +541,66 @@ class TestDecisionTable:
         assert outcome is TickOutcome.SWITCHED
         assert waits.waits == []
 
+    def _buffered(self, temp_home, during_wait):
+        """A proactive 1 -> 3 decision whose random buffer runs ``during_wait``."""
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, switch_buffer_seconds=300)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        waits = RecordingWait()
+        waits.wait = lambda seconds: (during_wait(h, waits), False)[1]
+        h.engine._stop = waits
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(10),
+        })
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        return h, outcome, reasons
+
+    def test_a_stop_during_the_switch_buffer_does_not_switch(self, temp_home):
+        def stop(h, waits):
+            waits.is_set = lambda: True  # auto-switch turned off mid-wait
+
+        h, outcome, reasons = self._buffered(temp_home, stop)
+        assert outcome is TickOutcome.NO_ACTION
+        assert reasons == ["decision-changed"]
+        assert h.switcher.current_account_number() == "1"
+        assert "lastSwitchAt" not in h.state()
+
+    def test_a_move_during_the_switch_buffer_is_not_undone(self, temp_home):
+        # The tray's limit switch (a plain `cswap switch`) writes no
+        # lastSwitchAt, so the cooldown cannot see it.
+        def limit_switch(h, waits):
+            h.make_live("b@example.com", 2)
+
+        h, outcome, reasons = self._buffered(temp_home, limit_switch)
+        assert outcome is TickOutcome.NO_ACTION
+        assert reasons == ["decision-changed"]
+        assert h.switcher.current_account_number() == "2"
+
+    def test_a_target_held_during_the_switch_buffer_is_skipped_on_macos(self, temp_home):
+        held: set[str] = set()
+
+        def window_opens(h, waits):
+            held.add("3")  # a `cswap run` window picks up account 3
+
+        with (
+            patch.object(ClaudeAccountSwitcher, "follows_logins", return_value=False),
+            patch.object(
+                ClaudeAccountSwitcher, "live_session_pids_for",
+                side_effect=lambda num, email: [4242] if num in held else [],
+            ),
+        ):
+            h, outcome, reasons = self._buffered(temp_home, window_opens)
+        assert outcome is TickOutcome.NO_ACTION
+        assert reasons == ["decision-changed"]
+        assert h.switcher.current_account_number() == "1"
+
+    def test_an_unchanged_decision_still_switches_after_the_buffer(self, temp_home):
+        h, outcome, reasons = self._buffered(temp_home, lambda h, waits: None)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.switcher.current_account_number() == "3"
+
     def test_cooldown_expires(self, harness):
         harness.engine._mutate_state(
             lambda s: s.update(lastSwitchAt=harness.clock())

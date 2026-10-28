@@ -1354,7 +1354,8 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(
-                    num, email, trigger, left_snapshot, entry, active_headroom
+                    num, email, trigger, left_snapshot, entry, active_headroom,
+                    current,
                 )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
@@ -1388,7 +1389,8 @@ class AutoSwitchEngine:
                 continue
             try:
                 return self._perform(
-                    num, email, trigger, left_snapshot, entry, active_headroom
+                    num, email, trigger, left_snapshot, entry, active_headroom,
+                    current,
                 )
             except SwitchError:
                 if not self.switcher.live_session_pids_for(num, email):
@@ -2131,6 +2133,7 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
         entry: UsageEntry | None = None,
         active_headroom: float | None = None,
+        decided_from: str | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2168,6 +2171,13 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
+                return TickOutcome.NO_ACTION
+            reason = self._buffer_invalidated(number, email, decided_from)
+            if reason:
+                self._emit(NoSwitchEvent(
+                    reason="decision-changed",
+                    detail=f"{reason} during the random switch delay; re-deciding next tick",
+                ))
                 return TickOutcome.NO_ACTION
 
         # Hold the state lock across the whole recheck -> switch -> record
@@ -2226,6 +2236,31 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _buffer_invalidated(
+        self, number: str, email: str, decided_from: str | None
+    ) -> str:
+        """Why a decision made before the random buffer no longer holds, or "".
+
+        The wait is up to 300 s: auto-switch may have been turned off (stop),
+        the user or the tray's limit switch may have moved the login (neither
+        writes ``lastSwitchAt``, so the cooldown misses them), and the target
+        may have been quarantined, disabled, or picked up by a live ``cswap
+        run`` window (refused on macOS, see ``_freshen_target``).
+        """
+        if self._stop.is_set():
+            return "auto-switch was stopped"
+        if self.switcher.current_account_number() != decided_from:
+            return "the active account changed"
+        quarantine = self._read_state().get("quarantine")
+        if (
+            isinstance(quarantine, dict) and number in quarantine
+        ) or number not in self.switcher.switchable_account_numbers():
+            return f"account {number} left rotation"
+        status = self._freshen_target(number, email)
+        if status != "ok":
+            return f"account {number} is no longer a viable target ({status})"
+        return ""
 
     def _switch_buffer(
         self, trigger: str, active_headroom: float | None = None
