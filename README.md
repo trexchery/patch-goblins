@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/trexchery/patch-goblins/releases/latest"><img src="https://img.shields.io/github/v/release/trexchery/patch-goblins?style=flat-square&color=56a83e&label=download" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows%2011-x64-2e6b30?style=flat-square" alt="Windows 11 x64">
+  <a href="docs/macos.md"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-2e6b30?style=flat-square" alt="macOS Apple Silicon"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2e6b30?style=flat-square" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/telemetry-none-2e6b30?style=flat-square" alt="No telemetry">
 </p>
@@ -31,7 +32,7 @@ Type a goal into the agents terminal, like `goal: the app has a settings page; n
 - **🟢 Spare quota becomes finished work.** Every run is routed to the account with the most room in that model's own weekly window. Goblins step aside while you're using an account, rest near their limits, and pick up again when a window resets.
 - **🧪 Nothing reaches you unchecked.** Each change runs your verification command, then gets a fresh read-only review. Failures go back to the same session, and the model or effort is raised only when it has to be.
 - **🔒 Goblins can't push.** Their environment has no GitHub login. Patch Goblins pushes only after the checks pass, and holds anything that touches `.github/`. Goblins never merge, deploy, or close issues.
-- **🪟 Built for Windows.** A native tray app with no WSL, Docker, or browser cookies. Logins stay on your PC, encrypted with DPAPI.
+- **🪟 Built for Windows, now on macOS.** A native Windows tray app, and an Apple Silicon menu bar app running the same orchestration. No WSL, Docker, or browser cookies. Logins stay on your machine: DPAPI on Windows, the Keychain on macOS.
 
 ## How it compares
 
@@ -47,7 +48,9 @@ Patch Goblins is built on claude-swap's credential and quota engine. Both are lo
 
 ## Quick start
 
-**Apple Silicon macOS:** see [installation, native menu bar, and verification](docs/macos.md). From a source checkout, `bash macos/install.sh` builds and installs the app. Development downloads are attached to the [macOS workflow](https://github.com/trexchery/patch-goblins/actions/workflows/macos.yml) after its packaging job succeeds.
+**Apple Silicon macOS (12+):** see [installation, native menu bar, and verification](docs/macos.md). From a source checkout, `bash macos/install.sh` builds and installs the app. Development downloads are attached to the [macOS workflow](https://github.com/trexchery/patch-goblins/actions/workflows/macos.yml) after its packaging job succeeds. Known gaps against the Windows tray are listed there.
+
+**Windows 11:**
 
 > Needs Windows 11 x64, [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Git for Windows](https://git-scm.com/download/win) and the [GitHub CLI](https://cli.github.com/) (`gh auth login`).
 
@@ -87,7 +90,8 @@ Goblins work only while that terminal is open. Close it and they pause; reopen i
 
 **🔋 Upkeep**
 
-- auto-switch near a limit (opt-in)
+- auto-switch near a limit (opt-in), even onto an account your own windows hold
+- windows stopped at a limit move to an account with room and reopen where they were
 - Auto-Prime starts fresh 5-hour windows early
 - quota notifications
 - resume sessions a limit stopped
@@ -108,7 +112,7 @@ Full details, limits and costs: **[docs/agents.md](docs/agents.md)**.
 - **Only your issues.** Issues from strangers are never picked up. Only comments from you or the repository's collaborators count.
 - **One account works too.** Agents then share it: they queue while your own terminals are busy and never close a session of yours.
 - **The goblin terminal** is a session-only theme. A small preload script swaps Claude Code's mascot glyphs for the goblin on their way to the screen. Nothing of Claude's is modified or installed.
-- **Unsigned releases**, so SmartScreen may warn. A `.sha256` checksum ships with every download. See [SECURITY.md](SECURITY.md).
+- **Unsigned releases**, so SmartScreen may warn. macOS builds are ad hoc signed and not notarized, so Gatekeeper may ask too. A `.sha256` checksum ships with every download. See [SECURITY.md](SECURITY.md).
 - **Upgrading** from handoff, Autodock, or ClautoSwap: quit the old tray and run the new exe once. Settings, agents, and logins carry over.
 
 </details>
