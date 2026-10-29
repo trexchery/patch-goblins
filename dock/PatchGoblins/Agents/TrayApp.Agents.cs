@@ -98,20 +98,6 @@ public sealed partial class TrayApp
             or System.ComponentModel.Win32Exception or IOException) { Program.Log(e); } // never faulted: every tick awaits it
     }
 
-    DateTimeOffset _lastAutoPrime;
-
-    /// With Auto-Prime on, fresh 5-hour windows are started early while agents run, so they also reset early.
-    /// The ledger stops a window being primed twice; this only paces the attempts.
-    void AutoPrimeForAgents()
-    {
-        if (!_settings.AutoPrime || _snap == null || _agents is not { IsRunning: true } || _priming || DateTimeOffset.Now - _lastAutoPrime < TimeSpan.FromMinutes(30)) return;
-        // The default login near its line: a prime would make the account it switches to (a fresh one) a live profile meanwhile.
-        if (_snap.Accounts.FirstOrDefault(a => a.Active) is { } login && ResumeStopped.Peak(login) >= Threshold - (_engineHysteresis ?? 10)) return;
-        if (Prime.Ready(_snap.Accounts, DateTimeOffset.Now) is not { Count: > 0 } ready) return;
-        _lastAutoPrime = DateTimeOffset.Now;
-        _ = PrimeAsync(ready);
-    }
-
     /// Once a day, from 8:00 on: what the agents did meanwhile. ponytail: fixed hour, a setting if it needs to move.
     void MorningSummary()
     {
@@ -127,7 +113,6 @@ public sealed partial class TrayApp
     {
         if (_agents == null) return;
         MorningSummary();
-        AutoPrimeForAgents();
         RefreshTeam();
         foreach (var repo in _agents.Repos)
             if (AgentsTerminal.StatusOf(repo, AgentsTerminal.WebOf(repo.Path)) is var state && (!_labels.TryGetValue(repo.Path, out var was) || was != state))
