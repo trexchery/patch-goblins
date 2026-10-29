@@ -147,7 +147,11 @@ public class LimitWatchTests
                 {
                     Attempts++;
                     await SwitchGate;
-                    if (Deferred) throw new EngineException("Default-profile Claude sessions are active or unreadable; automatic account switch deferred until they exit.");
+                    if (Deferred)
+                    {
+                        var error = Json.TryError("""{"schemaVersion":1,"error":{"type":"SwitchError","message":"Default-profile Claude sessions are active or unreadable; automatic account switch deferred until they exit."}}""");
+                        throw new EngineException(error!.Message!);
+                    }
                     if (Failing.Contains(m)) throw new EngineException("lock timeout");
                     Switched.Add(m);
                     var from = Default;
