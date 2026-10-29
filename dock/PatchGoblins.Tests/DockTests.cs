@@ -890,7 +890,8 @@ public class RenderTests(Xunit.Abstractions.ITestOutputHelper output)
             settings.Search.Text = "approval";
             Eq(["Ask for approval"], settings.VisibleRows.ToList(), "search \"approval\"");
             settings.Search.Text = "";
-            Eq(15, settings.VisibleRows.Count(), "all settings rows"); // both "Random switch delay" and "Automatic switch line"
+            Eq(14, settings.VisibleRows.Count(), "all settings rows");
+            True(!settings.VisibleRows.Contains("Move running workflows"), "unsafe workflow migration is not offered");
             form.CloseSettings();
             True(!form.SettingsOpen, "closing settings leaves them open");
             True(form.Visible, "closing settings keeps the flyout open, but it is hidden");
