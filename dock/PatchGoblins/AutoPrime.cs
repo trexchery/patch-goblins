@@ -4,8 +4,8 @@ using System.Text.RegularExpressions;
 namespace PatchGoblins;
 
 // Auto-Prime: start an account's fresh 5-hour window early with one tiny request, so it also resets
-// early. Off by default and never sent on a schedule: Patch Goblins tracks the windows, and one click
-// in the tray menu primes the fresh ones, invisibly (also automatically while agents run). That click doesn't settle whether Anthropic's
+// early. Off by default: once on, Patch Goblins tracks the windows and primes each fresh one invisibly
+// on its regular tick (a tray-menu click does it now). Turning it on doesn't settle whether Anthropic's
 // terms allow this use of a subscription (their Consumer Terms restrict automated access); the owner decides.
 
 /// What Patch Goblins keeps per account: diagnostics only, never the prompt or the reply.

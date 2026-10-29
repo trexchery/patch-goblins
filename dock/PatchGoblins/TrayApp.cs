@@ -172,6 +172,7 @@ public sealed partial class TrayApp : ApplicationContext
         {
             _busy = false;
         }
+        AutoPrimeTick();
         if (_settings.QuotaNotifications
             && QuotaAlerts.Balloon(fresh.SelectMany(f => _quota.Observe(f.Provider, f.Snap.Accounts)).ToList()) is { } balloon)
             Notify(balloon.Title, balloon.Text);
@@ -781,6 +782,20 @@ public sealed partial class TrayApp : ApplicationContext
         foreach (var line in Prime.Status(accounts, now).DefaultIfEmpty("No fresh 5-hour windows right now"))
             status.DropDownItems.Add(new ToolStripMenuItem(line) { Enabled = false });
         _menu.Items.Add(status);
+    }
+
+    DateTimeOffset _lastAutoPrime;
+
+    /// With Auto-Prime on, every tick starts fresh 5-hour windows early (overnight too), so they also reset early.
+    /// The ledger stops a window being primed twice; this only paces the attempts.
+    void AutoPrimeTick()
+    {
+        if (!_settings.AutoPrime || _snap == null || _priming || DateTimeOffset.Now - _lastAutoPrime < TimeSpan.FromMinutes(30)) return;
+        // The default login near its line: a prime would make the account it switches to (a fresh one) a live profile meanwhile.
+        if (_snap.Accounts.FirstOrDefault(a => a.Active) is { } login && ResumeStopped.Peak(login) >= Threshold - (_engineHysteresis ?? 10)) return;
+        if (Prime.Ready(_snap.Accounts, DateTimeOffset.Now) is not { Count: > 0 } ready) return;
+        _lastAutoPrime = DateTimeOffset.Now;
+        _ = PrimeAsync(ready);
     }
 
     /// Silent: no window, no transcript, no notification unless something needs the owner.
