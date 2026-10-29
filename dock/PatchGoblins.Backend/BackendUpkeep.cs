@@ -97,13 +97,13 @@ internal sealed partial class BackendUpkeep : IDisposable
             {
                 if (primer.Observe(snap.Accounts, now)) primer.Save();
                 if (primer.WantsReread(now)) { await engine.ListAsync(refresh: true); await refresh(); primer.Reread(now); }
-                // The original 30-minute guard and current login reserve apply.
-                if (threshold != null && supervisor.IsRunning && now - lastPrime >= TimeSpan.FromMinutes(30)
+                // Agents or not (overnight too); the original 30-minute guard and current login reserve apply.
+                if (threshold != null && now - lastPrime >= TimeSpan.FromMinutes(30)
                     && !(snap.Accounts.FirstOrDefault(a => a.Active) is { } login && ResumeStopped.Peak(login) >= EffectiveThreshold - hysteresis)
                     && primer.Ready(snap.Accounts, now) is { Count: > 0 } ready)
                 {
                     lastPrime = now;
-                    await PrimeCandidatesAsync(ready, () => settings.AutoPrime && supervisor.IsRunning);
+                    await PrimeCandidatesAsync(ready, () => settings.AutoPrime);
                 }
             }
             if (!settings.AutoSwitch || threshold == null || disposed) return;
