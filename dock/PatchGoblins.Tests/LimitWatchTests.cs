@@ -130,6 +130,8 @@ public class LimitWatchTests
         public List<string> Reports = [];
         public List<string> Log = [];
         public HashSet<int> Failing = [];
+        public bool Deferred;
+        public int Attempts;
         public LimitSwitch Switch;
         public double Line = ResumeStopped.Full, Hysteresis;
         public Func<string, Task> Report = _ => Task.CompletedTask;
@@ -143,7 +145,9 @@ public class LimitWatchTests
             Switch = new LimitSwitch(() => Snap, () => (Default, Changed), () => Live, d => { Reports.Add(d); return Report(d); },
                 async m =>
                 {
+                    Attempts++;
                     await SwitchGate;
+                    if (Deferred) throw new EngineException("Default-profile Claude sessions are active or unreadable; automatic account switch deferred until they exit.");
                     if (Failing.Contains(m)) throw new EngineException("lock timeout");
                     Switched.Add(m);
                     var from = Default;
@@ -222,6 +226,16 @@ public class LimitWatchTests
         var o = await all.Hit(Now, Now.AddHours(1));
         Assert.NotNull(o!.Error); // the tray then falls back to the engine's own check
         Assert.Contains(all.Log, l => l.Contains("switch 1->2 failed"));
+    }
+
+    [Fact]
+    public async Task LiveDefaultSessionDeferralIsReportedWithoutTryingOtherTargets()
+    {
+        var rig = new Rig(A(1, 50, active: true), A(2, 20), A(3, 30)) { Deferred = true };
+        var outcome = await rig.Hit(Now, Now.AddHours(1));
+        Assert.Contains("automatic account switch deferred", outcome!.Error);
+        Assert.Equal(1, rig.Attempts);
+        Assert.Empty(rig.Switched);
     }
 
     [Fact]

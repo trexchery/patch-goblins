@@ -67,9 +67,8 @@ The terminal keeps the goblin theme, session commands, status line, and mascot p
 
 ## Known gaps against the Windows tray
 
-- Windows moves a window in a shell at its limit, and moves onto an account a `cswap run` window holds, then keeps the two logins in step (`follow_logins`). macOS does neither: the profile's login lives in a keychain entry only `claude` writes, so the backend's switch stays `--exclusive` and auto-switch skips a held account.
-- The backend's upkeep (`BackendUpkeep`) has no `Movable` or shell-at-limit moves and does not open the replacement window before closing the old one; that wiring exists only in the Windows `TrayApp`.
-- **Move running workflows** (Agent settings menu, off by default, asks once) works as on Windows ([agents](agents.md#resilience)): a `cswap run` window whose workflows are paused (no agent in flight for 20 s, or every agent parked at the limit, none mid-tool) is closed, copied and relaunched with a prompt naming each run's script and run id. The same order (close, copy, launch) is what Windows uses for these windows. A failed relaunch notifies with the command and the run ids. In practice these windows move at the limit, once their agents are paused: Claude Code keeps the session record "busy" while a background workflow runs, and a busy window is never moved before the limit. A window whose claude has not exited after the kill is neither copied nor relaunched; the notice gives `cswap run N -- --resume <session>` and the run ids.
+- Auto-switch uses an exclusive Keychain login and skips accounts held by another session. User terminals, including tabs and workflow sessions, remain open; a session at its limit may need attention from its owner. Patch Goblins does not close or automatically migrate those sessions.
+- Headless runs owned by the Supervisor may yield their account when safe; unknown headless runs and user terminals keep their account.
 
 ## Build and verification
 

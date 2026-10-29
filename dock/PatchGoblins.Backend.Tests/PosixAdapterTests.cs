@@ -9,8 +9,8 @@ namespace PatchGoblins.Tests;
 
 public sealed class PosixAdapterTests
 {
-    /// The macOS move (BackendUpkeep.ResumeAsync) shares `Decide`: an idle window whose project has a workflow running is left alone,
-    /// and one at its limit is only reported. Synthetic run folders on the native file system.
+    /// Shared move decisions leave a workflow running in another session alone.
+    /// The macOS backend no longer closes or moves terminal sessions.
     [Fact]
     public void AWindowRunningAWorkflowIsNeverMovedOnPosix()
     {
@@ -30,8 +30,8 @@ public sealed class PosixAdapterTests
         Assert.Equal(ResumeStopped.Step.Ignore, ResumeStopped.Decide(idle, TimeSpan.FromHours(1), TimeSpan.Zero, 4, false, 0, () => true, true, DateTime.UtcNow));
     }
 
-    /// MoveWorkflows on macOS: the window's own run, its one agent parked at a 429, moves (BackendUpkeep.ResumeAsync then closes, copies,
-    /// launches), and the reopened window is told the script's forward-slash path in the destination profile.
+    /// Shared workflow decision and resume arguments for a paused run.
+    /// The macOS backend keeps the original terminal open regardless.
     [Fact]
     public void APausedWorkflowMovesOnPosix()
     {

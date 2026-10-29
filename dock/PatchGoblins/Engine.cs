@@ -129,7 +129,7 @@ public sealed partial class Engine(string exe)
     /// profile's lives in a keychain entry only claude writes), so `--exclusive` stays: the engine refuses a held account.
     public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(SwitchNowArgs(number, OperatingSystem.IsMacOS()), gated: false);
 
-    internal static string[] SwitchNowArgs(int number, bool macOS) => macOS ? ["switch", number.ToString(), "--json", "--exclusive"] : ["switch", number.ToString(), "--json"];
+    internal static string[] SwitchNowArgs(int number, bool macOS) => macOS ? ["switch", number.ToString(), "--json", "--exclusive", "--protect-live-default"] : ["switch", number.ToString(), "--json", "--protect-live-default"];
 
     public async Task ImportUsageAsync(string document)
     {

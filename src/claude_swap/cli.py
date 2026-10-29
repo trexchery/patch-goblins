@@ -1247,6 +1247,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--protect-live-default",
+        action="store_true",
+        help="Defer a switch while a default-profile Claude session is running or unreadable",
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1540,6 +1545,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
                 force=args.force,
                 exclusive=args.exclusive,
+                protect_live_default=args.protect_live_default,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)

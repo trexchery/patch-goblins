@@ -176,6 +176,7 @@ class EngineHarness:
         self.switcher._write_json(self.switcher.sequence_file, data)
 
     def make_live(self, email: str, num: int) -> None:
+        (self.temp_home / ".claude" / "sessions").mkdir(parents=True, exist_ok=True)
         (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
         }))
@@ -216,6 +217,41 @@ def harness(temp_home: Path) -> EngineHarness:
     h.seed(3, "c@example.com")
     h.make_live("a@example.com", 1)
     return h
+
+
+@pytest.mark.parametrize("scan", [([object()], 0), ([], 1)])
+def test_auto_switch_preserves_live_or_unreadable_default_sessions(harness, scan):
+    credentials = harness.switcher._read_credentials()
+    with patch("claude_swap.process_detection.scan_sessions", return_value=scan):
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(30)})
+    assert outcome is TickOutcome.ERROR
+    assert harness.active_number() == 1
+    assert harness.switcher._read_credentials() == credentials
+    assert any("automatic account switch deferred" in e.message for e in harness.events if isinstance(e, ErrorEvent))
+
+
+def test_auto_switch_defers_if_default_session_directory_cannot_be_read(harness):
+    with patch("claude_swap.process_detection.scan_sessions", side_effect=PermissionError("denied")):
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(30)})
+    assert outcome is TickOutcome.ERROR
+    assert harness.active_number() == 1
+
+
+def test_auto_switch_detects_a_real_default_session_record(harness):
+    sessions = harness.temp_home / ".claude" / "sessions"
+    (sessions / f"{os.getpid()}.json").write_text(json.dumps({
+        "pid": os.getpid(), "sessionId": "test-session", "kind": "interactive",
+    }))
+    credentials = harness.switcher._read_credentials()
+    assert harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(30)}) is TickOutcome.ERROR
+    assert harness.active_number() == 1
+    assert harness.switcher._read_credentials() == credentials
+
+
+def test_auto_switch_defers_when_default_session_directory_missing(harness):
+    (harness.temp_home / ".claude" / "sessions").rmdir()
+    assert harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(30)}) is TickOutcome.ERROR
+    assert harness.active_number() == 1
 
 
 class TestEngineHarnessIsolation:

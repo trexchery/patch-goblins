@@ -154,14 +154,13 @@ internal sealed partial class BackendUpkeep : IDisposable
         catch (Exception error) { Program.Log(error); }
     }
 
-    async Task ResumeAsync(Snapshot snap)
+    internal async Task ResumeAsync(Snapshot snap)
     {
         var login = ResumeStopped.DefaultLogin();
         var stops = await Task.Run(() => ResumeStopped.Scan(ResumeStopped.ConfigDirs(snap.ActiveAccountNumber), DateTime.UtcNow,
             login.Account == snap.ActiveAccountNumber ? login.ChangedAt : DateTime.MaxValue, includeBusy: true, agentLimits: agentLimits));
         if (ResumeStopped.LimitReport(stops, snap.Accounts, DateTimeOffset.UtcNow, reported) is { } report)
             await engine.ImportUsageAsync(report);
-        var load = new Dictionary<int, int>();
         foreach (var stop in stops.DistinctBy(s => s.SessionId))
         {
             if (!settings.AutoSwitch || disposed) return;
@@ -171,55 +170,16 @@ internal sealed partial class BackendUpkeep : IDisposable
                     notify("Agents terminal stopped at a limit", $"Reopen the agents terminal in {stop.Cwd} from the Patch Goblins menu.");
                 continue;
             }
-            var target = stop.Idle || settings.MoveWorkflows && stop.Running ? ResumeStopped.Target(stop, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null,
-                EffectiveThreshold, hysteresis, DateTimeOffset.UtcNow, load, limits.RefusedUntil, LiveOrLaunching(), limits.ScopedRefusedUntil,
+            var target = stop.AtLimit ? ResumeStopped.Target(stop, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null,
+                EffectiveThreshold, hysteresis, DateTimeOffset.UtcNow, null, limits.RefusedUntil, LiveOrLaunching(), limits.ScopedRefusedUntil,
                 line: settings.AutoLine ? a => switchLine.For(a, stop.Model) : null, followsLogins: followsLogins) : null;
-            var key = $"{stop.SessionId}#{target}";
-            var decision = ResumeStopped.Decide(stop, ResumeStopped.UserIdle(), TimeSpan.FromSeconds(5), target,
-                moves.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
-                ResumeStopped.MovesInLastHour(moves, stop.SessionId, DateTime.UtcNow), () => ResumeStopped.Unchanged(stop, settings.MoveWorkflows), settings.MoveWorkflows, DateTime.UtcNow);
-            if (decision != ResumeStopped.Step.Move || target is not { } number) continue;
-            var account = snap.Accounts.First(a => a.Number == number);
-            var destination = account.Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(number)!;
-            var destinations = new[] { destination, ResumeStopped.DefaultDir, ResumeStopped.ProfileDir(number) }
-                .OfType<string>().Distinct(StringComparer.Ordinal).ToArray();
-            void Copy() { foreach (var dir in destinations) ResumeStopped.CopyTranscript(stop, dir); }
-            if (stop.Limit is { } old) watch.Remember(old.At);
-            if (agentLimits.TryGetValue(stop.SessionId, out var agent)) watch.Remember(agent.At);
-            await Task.Run(Copy); // a failed copy closes nothing
-            if (!settings.AutoSwitch || disposed || !ResumeStopped.Unchanged(stop, settings.MoveWorkflows)
-                || ResumeStopped.UserIdle() < (stop.AtLimit ? TimeSpan.FromSeconds(5) : TimeSpan.FromSeconds(60))
-                || !ResumeStopped.SafeToClose(number, limits.RefusedUntil, limits.Switching || autoTask is { IsCompleted: false },
-                    login.Account, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow)) continue;
-            moves[key] = DateTime.UtcNow;
-            ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); // failure here closes nothing
-            var runs = string.Join(", ", (stop.Runs ?? []).Select(r => r.RunId));
-            // A workflow window must be gone before its runs resume elsewhere: one still there after the kill is neither copied nor reopened.
-            if (!await ResumeStopped.CloseAsync(stop.Pid, stop.Record) && stop.Running)
-            {
-                Program.Log($"workflows {runs} in {Path.GetFileName(stop.Cwd.TrimEnd('/'))} not moved: the old window did not exit");
-                notify("A paused workflow's window did not close", $"Nothing was moved. Once it has exited, in {stop.Cwd}: cswap run {number} -- --resume {stop.SessionId} (paused workflows {runs})");
-                continue;
-            }
-            try { await Task.Run(Copy); } catch (Exception error) { Program.Log(error); }
-            moves[key] = moves[ResumeStopped.MoveStamp(stop.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
-            try { ResumeStopped.SaveMoves(movesPath, moves, DateTime.UtcNow); }
-            catch (Exception error) { Program.Log(error); } // a closed session must still be reopened if this save fails
-            // A window paused with workflows running (MoveWorkflows) was closed above, before this copy: its runs resume in the new one.
-            if (stop.Running) Program.Log($"workflows {runs} in {Path.GetFileName(stop.Cwd.TrimEnd('/'))} paused: #{stop.Account} to #{number}");
-            try
-            {
-                engine.LaunchConsole($"Claude · {account.ShortName} · resumed", stop.Cwd,
-                    Launch.Run(number, settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(stop, stop.Running ? destination : null)));
-            }
-            catch (Exception error)
-            {
-                Program.Log(error);
-                notify("Could not reopen a stopped window", $"In {stop.Cwd}: cswap run {number} -- --resume {stop.SessionId}" + (stop.Running ? $" (paused workflows {runs})" : ""));
-            }
-            limits.Forget(stop.SessionId);
-            agentLimits.Remove(stop.SessionId);
-            load[number] = load.GetValueOrDefault(number) + 1;
+            if (target is not { } number || !stop.AtLimit) continue;
+            // Terminal.app can accept an AppleScript request without proving that
+            // a replacement Claude session started. Keep the existing session
+            // alive and let its owner decide when and how to resume.
+            if (told.Add($"manual-move:{stop.SessionId}:{number}"))
+                notify("Terminal needs attention", $"A session in {stop.Cwd} is at its limit and account #{number} has room. The session remains open; continue or restart it yourself when ready.");
+
         }
     }
 

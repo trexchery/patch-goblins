@@ -132,24 +132,22 @@ def test_backend_auto_switch_setting_updates_menu_without_rewriting_backend(monk
     settings.save.assert_called_once()  # an unchanged backend snapshot does not churn the file
 
 
-def test_move_workflows_asks_once_before_it_goes_on(monkeypatch):
-    answers = []
-    monkeypatch.setitem(sys.modules, "rumps", types.SimpleNamespace(alert=lambda **kw: answers.pop(0)))
-    client = MagicMock()
-    client.events = queue.Queue()
-    with patch("claude_swap.goblins.BackendClient", return_value=client):
+def test_desktop_settings_do_not_offer_automatic_workflow_moves():
+    class Item:
+        def __init__(self, title, callback=None):
+            self.title = title
+            self.callback = callback
+            self.children = []
+
+        def add(self, item):
+            self.children.append(item)
+
+    with patch("claude_swap.goblins.BackendClient", return_value=MagicMock()):
         extension = goblins.MenuExtension()
-    extension._background = lambda work: work()
-    extension._refresh = lambda: None
-    answers.append(0)  # Cancel: nothing saved
-    extension._toggle_setting("moveWorkflows", True, {})
-    client.request.assert_not_called()
-    answers.append(1)
-    extension._toggle_setting("moveWorkflows", True, {})
-    client.request.assert_called_once_with("settings", {"values": {"moveWorkflows": True}})
-    extension._toggle_setting("moveWorkflows", True, {"moveWorkflowsAccepted": True})  # agreed before: no question
-    extension._toggle_setting("moveWorkflows", False, {})  # turning it off never asks
-    assert client.request.call_count == 3 and answers == []
+    extension.snapshot = {"config": {"moveWorkflows": True}}
+    menu = extension._desktop_settings(types.SimpleNamespace(MenuItem=Item))
+    assert "Move running workflows" not in [item.title for item in menu.children]
+    assert "Auto-Prime" in [item.title for item in menu.children]
 
 
 def test_terminal_command_quotes_paths_and_never_uses_shell(monkeypatch, tmp_path):
