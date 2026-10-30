@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import sys
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -281,12 +282,19 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
     below is the scan-shaped view that drops it.
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
-    if not sessions_dir.is_dir():
+    try:
+        mode = sessions_dir.stat().st_mode
+    except FileNotFoundError:
         return [], 0
+    if not stat.S_ISDIR(mode):
+        raise OSError(f"Session path is not a directory: {sessions_dir}")
 
     sessions = []
     unreadable = 0
-    for path in sessions_dir.glob("*.json"):
+    # iterdir propagates access errors; glob may silently treat an unreadable
+    # directory as empty, which is unsafe for a guard.
+    paths = list(sessions_dir.iterdir())
+    for path in (p for p in paths if p.name.endswith(".json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = data["pid"]
@@ -323,11 +331,13 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
         ) as exc:
             unreadable += 1
             logger.debug("Skipping session file %s: %s", path, exc)
-    sessions.extend(_keyed_sessions(sessions_dir, {s.pid for s in sessions}))
+    keyed, key_unreadable = _keyed_sessions(paths, {s.pid for s in sessions})
+    sessions.extend(keyed)
+    unreadable += key_unreadable
     return sessions, unreadable
 
 
-def _keyed_sessions(sessions_dir: Path, known: set[int]) -> list[ClaudeSession]:
+def _keyed_sessions(paths: list[Path], known: set[int]) -> tuple[list[ClaudeSession], int]:
     """Live claudes with a ``{pid}.<hash>.key`` but no ``{pid}.json``.
 
     Claude Code writes the key seconds before the record at start, and no
@@ -337,7 +347,8 @@ def _keyed_sessions(sessions_dir: Path, known: set[int]) -> list[ClaudeSession]:
     started after the key was written holds a recycled pid and is skipped.
     """
     found = []
-    for path in sessions_dir.glob("*.key"):
+    unreadable = 0
+    for path in (p for p in paths if p.name.endswith(".key")):
         try:
             pid = int(path.name.split(".", 1)[0])
             if pid in known or not is_pid_alive(pid):
@@ -349,8 +360,9 @@ def _keyed_sessions(sessions_dir: Path, known: set[int]) -> list[ClaudeSession]:
             found.append(ClaudeSession(pid=pid, session_id="", cwd="", started_at=0,
                                        kind="interactive", entrypoint="cli"))
         except (ValueError, OverflowError, OSError) as exc:
+            unreadable += 1
             logger.debug("Skipping session key %s: %s", path, exc)
-    return found
+    return found, unreadable
 
 
 def _started_epoch(pid: int) -> float | None:

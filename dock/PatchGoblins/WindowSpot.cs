@@ -10,7 +10,8 @@ public sealed record WindowSpot(int Left, int Top, int Right, int Bottom, bool M
     static readonly object Attaching = new(); // a process has one console: one attach at a time
     static readonly SemaphoreSlim Opening = new(1, 1); // one new window at a time, so each finds its own
 
-    /// The window a console program draws in: the Windows Terminal window that owns its pseudoconsole, or conhost's own. 0: none.
+    /// A console's native window handle. Under ConPTY this is a hidden compatibility
+    /// window, not the Windows Terminal window; Capture rejects that handle.
     public static nint WindowOf(int pid)
     {
         lock (Attaching)
@@ -21,11 +22,21 @@ public sealed record WindowSpot(int Left, int Top, int Right, int Bottom, bool M
         }
     }
 
-    /// Where `pid`'s window is now; null when it has none, or is minimized (it then opens wherever the terminal puts it).
+    /// Where a visible classic console sits. Null for a pseudoconsole, missing
+    /// window or minimized window; those open wherever the terminal chooses.
     public static WindowSpot? Of(int pid)
     {
-        try { return WindowOf(pid) is var h && h != 0 && !IsIconic(h) && GetWindowRect(h, out var r) ? new(r.L, r.T, r.R, r.B, IsZoomed(h)) : null; }
+        try { return Capture(WindowOf(pid)); }
         catch (Exception e) { Program.Log(e); return null; } // never in the way of a move
+    }
+
+    internal static WindowSpot? Capture(nint h)
+    {
+        // GetConsoleWindow under ConPTY may have a valid 16x16 rectangle even
+        // though it is not displayed. Never use it to size a real terminal.
+        if (h == 0 || !IsWindowVisible(h) || IsIconic(h) || GetAncestor(h, GA_ROOT) != h) return null;
+        return GetWindowRect(h, out var r) && r.R > r.L && r.B > r.T
+            ? new(r.L, r.T, r.R, r.B, IsZoomed(h)) : null;
     }
 
     /// Runs `launch`, which opens one terminal window, and puts that window at `spot` (null: left where it opens).
@@ -79,7 +90,7 @@ public sealed record WindowSpot(int Left, int Top, int Right, int Bottom, bool M
         return found;
     }
 
-    const uint GA_ROOTOWNER = 3, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10;
+    const uint GA_ROOT = 2, GA_ROOTOWNER = 3, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10;
     const int SW_RESTORE = 9, SW_MAXIMIZE = 3;
 
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }

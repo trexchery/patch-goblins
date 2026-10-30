@@ -8,9 +8,9 @@ public class SwitchNowArgsTests
 {
     [Fact]
     public void MacOSKeepsTheExclusiveRefusalOfAHeldAccount() =>
-        Assert.Equal(["switch", "3", "--json", "--exclusive"], Engine.SwitchNowArgs(3, macOS: true));
+        Assert.Equal(["switch", "3", "--json", "--exclusive", "--protect-live-default"], Engine.SwitchNowArgs(3, macOS: true));
 
     [Fact]
     public void WindowsSwitchesOntoAHeldAccount() =>
-        Assert.Equal(["switch", "3", "--json"], Engine.SwitchNowArgs(3, macOS: false));
+        Assert.Equal(["switch", "3", "--json", "--protect-live-default"], Engine.SwitchNowArgs(3, macOS: false));
 }

@@ -602,6 +602,49 @@ public static class ResumeStopped
         return (count, Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(MarkerLive) : 0);
     }
 
+    /// Conservative preflight before stopping owned agents to free an account.
+    /// The engine performs the authoritative check under its mutation lock.
+    /// Here unknown records, missing directories and inaccessible processes all
+    /// count as busy, so a failed switch does not needlessly interrupt agents.
+    internal static bool DefaultProfileClear(string dir)
+    {
+        static bool RunningOrUnknown(int pid)
+        {
+            if (pid <= 1) return true;
+            try { using var p = Process.GetProcessById(pid); return !p.HasExited; }
+            catch (ArgumentException) { return false; } // no such process
+            catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { return true; }
+        }
+
+        try
+        {
+            var sessions = Path.Combine(dir, "sessions");
+            if ((File.GetAttributes(sessions) & FileAttributes.Directory) == 0) return false;
+            foreach (var file in Directory.EnumerateFiles(sessions))
+            {
+                var ext = Path.GetExtension(file);
+                if (ext.Equals(".json", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(file));
+                    if (!doc.RootElement.TryGetProperty("pid", out var value) || !value.TryGetInt32(out var pid) || RunningOrUnknown(pid)) return false;
+                }
+                else if (ext.Equals(".key", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!int.TryParse(Path.GetFileName(file).Split('.')[0], out var pid) || RunningOrUnknown(pid)) return false;
+                }
+            }
+            var runs = Path.Combine(dir, ".cswap-runs");
+            try
+            {
+                if ((File.GetAttributes(runs) & FileAttributes.Directory) == 0 || Directory.EnumerateFiles(runs).Any(MarkerLive)) return false;
+            }
+            catch (FileNotFoundException) { } // a default profile may never have had a run wrapper
+            catch (DirectoryNotFoundException) { }
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException) { return false; }
+    }
+
     /// A wrapper's run marker names a live process: its pid runs and, when the marker holds the wrapper's creation stamp (a
     /// FILETIME), it is that process and not a recycled pid, as the engine's `_marker_is_live` checks.
     static bool MarkerLive(string marker)

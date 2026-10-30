@@ -2192,7 +2192,7 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            result = self.switcher.switch_to(number, json_output=True, protect_live_default=True)
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

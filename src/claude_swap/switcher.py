@@ -6442,6 +6442,7 @@ class ClaudeAccountSwitcher:
         json_output: bool = False,
         force: bool = False,
         exclusive: bool = False,
+        protect_live_default: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -6549,6 +6550,7 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
             exclusive=exclusive,
+            protect_live_default=protect_live_default,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6936,6 +6938,7 @@ class ClaudeAccountSwitcher:
         force_activate: bool = False,
         provenance: dict | None = None,
         exclusive: bool = False,
+        protect_live_default: bool = False,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7079,6 +7082,25 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            if protect_live_default:
+                # Check immediately before changing the login, after waiting for
+                # every mutation lock. Remote Control and running workflows are
+                # tied to the account that the default-profile process started on.
+                from claude_swap.process_detection import scan_sessions
+                from claude_swap.paths import get_claude_config_home
+
+                try:
+                    # An absent directory does not prove that an older or
+                    # newly-starting Claude has no process using this login.
+                    (get_claude_config_home() / "sessions").stat()
+                    sessions, unreadable = scan_sessions()
+                except OSError as exc:
+                    raise SwitchError("Cannot inspect default-profile sessions; automatic switch deferred") from exc
+                if sessions or unreadable:
+                    raise SwitchError(
+                        "Default-profile Claude sessions are active or unreadable; "
+                        "automatic account switch deferred until they exit."
+                    )
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

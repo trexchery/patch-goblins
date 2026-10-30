@@ -214,6 +214,12 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
                     if (r.Switched) log($"switch {n}->{m} {clockMs.ElapsedMilliseconds} ms");
                     return new LimitOutcome(r);
                 }
+                catch (EngineException e) when (e.Message.Contains("automatic switch deferred", StringComparison.OrdinalIgnoreCase)
+                    || e.Message.Contains("automatic account switch deferred", StringComparison.OrdinalIgnoreCase))
+                {
+                    _lastTry = now;
+                    return new LimitOutcome(Error: e.Message);
+                }
                 catch (Exception e) { log($"switch {n}->{m} failed: {e.Message}"); } // lock timeout, profile ahead, credential error: the next account
             }
             _lastTry = now;

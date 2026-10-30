@@ -90,11 +90,11 @@ Goblins work only while that terminal is open. Close it and they pause; reopen i
 
 **🔋 Upkeep**
 
-- auto-switch near a limit (opt-in), even onto an account your own windows hold
-- windows stopped at a limit move to an account with room and reopen where they were
+- auto-switch near a limit (opt-in), waiting while a default-login session is open
+- terminals and workflows stay open; resume a stopped session yourself on an account with room
 - Auto-Prime starts fresh 5-hour windows early
 - quota notifications
-- resume sessions a limit stopped
+- guidance for sessions stopped by a limit
 
 </td>
 </tr>
