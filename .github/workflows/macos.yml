@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   native-orchestration:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -52,7 +52,7 @@ jobs:
           if-no-files-found: ignore
 
   apple-silicon:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
