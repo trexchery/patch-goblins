@@ -12,16 +12,18 @@ namespace PatchGoblins;
 /// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle",
-    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null, string? Said = null, bool TurnOver = false)
+    string? Model = null, IReadOnlyList<WorkflowRun>? Runs = null, string? Said = null, bool TurnOver = false, bool Orphan = false, bool Cut = false)
 {
     public bool Idle => Status == "idle";
+    /// `Cut`: an orphan stopped mid-turn (not at a limit, not interrupted by its user): it is told to carry on.
+    /// `Orphan`: its terminal is gone (console host dead), so no one can reach the window and its record never leaves "busy": it counts as done.
     /// A workflow run is still going in the window's project folder: the window looks idle, but closing it would end the run.
     public bool Running => Runs is { Count: > 0 };
     /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
     /// so the background command runs on to its end (the reopened window is told). A window running workflows keeps its record
     /// "busy" until they settle, so at its limit "busy" counts too when the main transcript says its turn is over (`TurnOver`:
     /// it ends at a finished reply or at its own limit error); only `Paused` then lets it move, and never before the limit.
-    public bool Done => Idle || AtLimit && (Status == "shell" || Status == "busy" && Running && TurnOver);
+    public bool Done => Idle || Orphan || AtLimit && (Status == "shell" || Status == "busy" && Running && TurnOver);
     /// `Done` and no workflow running. (With MoveWorkflows on, a window running one moves only once `Paused`.)
     public bool Movable => Done && !Running;
 }
@@ -61,7 +63,9 @@ public static class ResumeStopped
     public static string[] ResumeArgs(StoppedSession s, string? configDir = null) =>
         s.Running ? ["--resume", s.SessionId, string.Join(" ", new[] { s.AtLimit ? Prompt + (s.Status == "shell" ? Background : "") : null }.Concat(s.Runs!.Select(r =>
                 $"Resume the paused workflow by calling Workflow with scriptPath {ScriptIn(s, r, configDir).Replace('\\', '/')} and resumeFromRunId {r.RunId}.")).OfType<string>())]
-        : s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
+        : s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")]
+        : s.Cut ? ["--resume", s.SessionId, OrphanPrompt] : ["--resume", s.SessionId];
+    public const string OrphanPrompt = "The terminal closed unexpectedly. Continue.";
 
     /// A run's script as `CopyTranscript` puts it under `configDir` (`projects/<project>/<sid>/workflows/scripts/<name>`); null: where it is.
     /// ponytail: a quote or ';' in that path (a profile folder named so) would reach the prompt as is; none of Claude Code's own names have one.
@@ -203,7 +207,7 @@ public static class ResumeStopped
     /// `includeBusy`: also windows stopped at a limit that are busy, in a shell or waiting (never moved: they are only told about).
     /// `agentLimits`: session id → a limit error seen in that session's subagent or workflow files.
     public static List<StoppedSession> Scan(IEnumerable<(string Dir, int? Account)> dirs, DateTime nowUtc, DateTime? defaultLoginChanged = null, bool includeBusy = false,
-        IReadOnlyDictionary<string, Limit>? agentLimits = null)
+        IReadOnlyDictionary<string, Limit>? agentLimits = null, Func<int, bool>? isOrphan = null)
     {
         var found = new List<StoppedSession>();
         var defaultSince = defaultLoginChanged ?? DefaultLogin().ChangedAt;
@@ -248,7 +252,13 @@ public static class ResumeStopped
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status, ModelOf(tail),
-                            RunningWorkflows(Path.GetDirectoryName(t)!, started), said, own != null || EndsTurn(tail)));
+                            RunningWorkflows(Path.GetDirectoryName(t)!, started), said, own != null || EndsTurn(tail), status != "agents" && (isOrphan ?? Orphaned)(pid)));
+                    // A window whose terminal died (a hung Terminal force-closed) keeps its claude alive and unreachable: quiet long enough, it is
+                    // reopened. One that ended its turn is reopened as it was, without a prompt; an interrupted one is told to carry on (AtLimit).
+                    else if (status != "agents" && nowUtc - Activity(t, id) >= OrphanQuiet && (isOrphan ?? Orphaned)(pid))
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, Activity(t, id), Status: status, Model: ModelOf(tail),
+                            Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started), Said: said, Orphan: true,
+                            Cut: !EndsTurn(tail) && said?.Contains("Request interrupted by user") != true));
                     else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status, Model: ModelOf(tail),
                             Runs: RunningWorkflows(Path.GetDirectoryName(t)!, started), Said: said));
@@ -1016,6 +1026,68 @@ public static class ResumeStopped
     {
         if (!since.TryGetValue(key, out var first)) since[key] = first = now;
         return now - first >= grace;
+    }
+
+    /// The newest write of a session: its transcript and everything under its folder (subagents, tool results), so a
+    /// long tool call or a subagent still writing keeps an orphan from looking quiet.
+    internal static DateTime Activity(string transcript, string sid)
+    {
+        var last = File.GetLastWriteTimeUtc(transcript);
+        try
+        {
+            var folder = Path.Combine(Path.GetDirectoryName(transcript)!, sid);
+            if (Directory.Exists(folder))
+                foreach (var f in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
+                    last = Max(last, File.GetLastWriteTimeUtc(f));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return last;
+        static DateTime Max(DateTime a, DateTime b) => a > b ? a : b;
+    }
+
+    /// Whether another live, reachable claude holds the same session (resumed by hand after the terminal died): reopening
+    /// the orphan then would run the session twice.
+    internal static bool HasLiveTwin(StoppedSession s)
+    {
+        foreach (var (dir, _) in ConfigDirs(null))
+            try
+            {
+                foreach (var rec in Directory.GetFiles(Path.Combine(dir, "sessions"), "*.json"))
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(rec));
+                    var r = doc.RootElement;
+                    if (Str(r, "sessionId") == s.SessionId && r.TryGetProperty("pid", out var p) && p.GetInt32() is var pid && pid != s.Pid
+                        && IsLiveClaude(pid, Str(r, "procStart"), kill: true) && !Orphaned(pid)) return true;
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { }
+        return false;
+    }
+
+    /// Quiet this long, an orphan is not mid-turn: its transcript is final.
+    public static readonly TimeSpan OrphanQuiet = TimeSpan.FromMinutes(2);
+
+    /// Whether `pid`'s console host (the ConPTY OpenConsole/conhost of its terminal, via ProcessConsoleHostProcess; the low two
+    /// bits are flags) has exited: then its window is gone and nothing can type into it. Only a positively dead host counts; a failed
+    /// query, no console (headless) or any doubt is "not orphaned", so a live window is never taken for one.
+    internal static bool Orphaned(int pid)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            var buf = Marshal.AllocHGlobal(nint.Size);
+            try
+            {
+                if (NtQueryInformationProcess(p.Handle, 49, buf, nint.Size, out _) != 0) return false;
+                var host = (int)(Marshal.ReadIntPtr(buf).ToInt64() & ~3L);
+                if (host <= 0) return false;
+                try { using var h = Process.GetProcessById(host); return h.HasExited; }
+                catch (ArgumentException) { return true; } // no such process
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
     }
 
     /// `kill`: the answer decides a close (`Unchanged`), so on macOS and Linux only a process proven to be the one that wrote

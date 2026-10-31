@@ -277,6 +277,85 @@ public class ResumeStoppedTests
     // `ahead` stands in for time passing: a stop must be this process's own (after it started), so staged errors are stamped now.
     static List<StoppedSession> ScanOf(string root, double ahead = 10) => ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(ahead), DateTime.MinValue);
 
+    static List<StoppedSession> OrphansOf(string root, bool orphan, double ahead = 600) =>
+        ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(ahead), DateTime.MinValue, includeBusy: true, isOrphan: _ => orphan);
+
+    [Fact]
+    public void OrphanedBusyWindowIsFoundAndMovableWithAContinue()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "busy", [Typed, ToolCall]); // its record stays "busy": nobody can type into it
+            var s = Assert.Single(OrphansOf(root, orphan: true));
+            Assert.True(s.Orphan && s.Cut && s.Movable && !s.AtLimit); // not a limit stop: no limit toast, no limit prompt
+            Assert.Equal(["--resume", "sid", ResumeStopped.OrphanPrompt], ResumeStopped.ResumeArgs(s));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void OrphanInterruptedByItsUserIsNotToldToCarryOn()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "busy", [Typed, """{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"""]);
+            Assert.Equal(["--resume", "sid"], ResumeStopped.ResumeArgs(Assert.Single(OrphansOf(root, orphan: true))));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void OrphanWhoseSubagentIsStillWritingIsNotQuiet()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "busy", [Typed, ToolCall]);
+            File.SetLastWriteTimeUtc(Path.Combine(root, "projects", "C--w", "sid.jsonl"), DateTime.UtcNow.AddHours(-1));
+            var sub = Path.Combine(root, "projects", "C--w", "sid", "subagents");
+            Directory.CreateDirectory(sub);
+            File.WriteAllText(Path.Combine(sub, "agent-1.jsonl"), "{}"); // written just now
+            Assert.Empty(OrphansOf(root, orphan: true, ahead: 30));
+            Assert.Single(OrphansOf(root, orphan: true, ahead: 600));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void OrphanThatEndedItsTurnIsReopenedWithoutAPrompt()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "busy", [Typed, Done]);
+            var s = Assert.Single(OrphansOf(root, orphan: true));
+            Assert.Equal(["--resume", "sid"], ResumeStopped.ResumeArgs(s));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void LiveWindowOrRecentlyWrittenOrphanIsNeverRecovered()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "busy", [Typed, ToolCall]);
+            Assert.Empty(OrphansOf(root, orphan: false));             // a live console host: not an orphan
+            Assert.Empty(OrphansOf(root, orphan: true, ahead: 30));   // written under 2 minutes ago: maybe mid-turn
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void OrphanedIsFalseForAProcessWithALiveConsoleHostOrNone()
+    {
+        Assert.False(ResumeStopped.Orphaned(Environment.ProcessId)); // the test host: its console is alive, or it has none
+        Assert.False(ResumeStopped.Orphaned(int.MaxValue));          // no such process: never a reason to kill anything
+    }
+
     [Fact]
     public void FreshlyReopenedClaudeIsNotStoppedByItsCopiedTranscript()
     {

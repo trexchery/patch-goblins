@@ -406,6 +406,51 @@ public sealed partial class TrayApp : ApplicationContext
                 : "When it is safe, reopen or resume the session on an account with room.";
             Notify("Terminal stopped at a limit", $"{folder} has reached a usage limit. {guidance}", ToolTipIcon.Warning);
         }
+        await RecoverOrphansAsync(snap, stopped.Where(s => s.Orphan).ToList());
+    }
+
+    static readonly TimeSpan OrphanGrace = TimeSpan.FromSeconds(90);
+    readonly Dictionary<string, DateTime> _orphanSince = []; // session id → first scan that saw it orphaned
+
+    /// The one automatic close: a window whose terminal died (a hung Terminal force-closed) leaves a claude no one can reach.
+    /// Orphaned for `OrphanGrace`, quiet, and unchanged since the scan, it is ended and reopened with `--resume` (a stopped turn is
+    /// told to carry on) on an account with room. Nothing with a live window is ever touched: `Orphaned` needs a dead console host.
+    async Task RecoverOrphansAsync(Snapshot snap, List<StoppedSession> orphans)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var k in _orphanSince.Keys.Where(k => orphans.All(o => o.SessionId != k)).ToList()) _orphanSince.Remove(k);
+        var load = new Dictionary<int, int>();
+        foreach (var s in orphans)
+        {
+            if (!s.Movable || !ResumeStopped.BusyPast(_orphanSince, s.SessionId, now, OrphanGrace)) continue;
+            // Reopened a moment ago and orphaned again: leave it, a loop of reopens helps no one.
+            if (_resumed.Any(m => m.Key.StartsWith(s.SessionId + "#") && now - m.Value < TimeSpan.FromMinutes(10))) continue;
+            // As a stop at a limit for the choice: its own account when it has room, else the one with the most. An own account
+            // with no profile folder (the login moved on) cannot be reopened on: choose again without it.
+            int? Pick(StoppedSession x) => ResumeStopped.Target(x, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, Threshold, _engineHysteresis ?? 10,
+                DateTimeOffset.UtcNow, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil);
+            string? DirOf(int n) => snap.Accounts.First(a => a.Number == n).Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(n);
+            var asStop = s with { AtLimit = true };
+            if (Pick(asStop) is not { } n) continue;
+            if (DirOf(n) == null) { if (Pick(asStop with { Account = null }) is { } m) n = m; else continue; }
+            if (DirOf(n) is not { } dir) continue;
+            // Right before the close: still the process that wrote the record, still quiet, still unreachable, and not run twice.
+            if (!ResumeStopped.Unchanged(s) || ResumeStopped.Activity(s.Transcript, s.SessionId) != s.Seen || !ResumeStopped.Orphaned(s.Pid)
+                || ResumeStopped.HasLiveTwin(s)) continue;
+            if (!await ResumeStopped.CloseAsync(s.Pid, s.Record)) continue;
+            try { ResumeStopped.CopyTranscript(s, dir); } catch (Exception e) { Program.Log(e); }
+            try { _engine.LaunchConsole($"Claude · #{n} · resumed", s.Cwd, Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s))); }
+            catch (Exception e)
+            {
+                Program.Log(e); // its claude is already ended: say so, the transcript is intact for `--resume`
+                Notify("Could not reopen a session", $"{Path.GetFileName(s.Cwd.TrimEnd('\\', '/'))} lost its terminal and could not be reopened. Resume {s.SessionId} by hand.", ToolTipIcon.Warning);
+                continue;
+            }
+            _resumed[$"{s.SessionId}#{n}"] = now;
+            ResumeStopped.SaveMoves(MovesPath, _resumed, now);
+            load[n] = load.GetValueOrDefault(n) + 1;
+            Program.Log($"orphan {s.SessionId} (its terminal died) reopened on #{n}");
+        }
     }
 
     /// An account held by any interactive session stays pinned. Only known headless agent
